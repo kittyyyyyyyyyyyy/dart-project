@@ -1,0 +1,8 @@
+cd ~/Desktop/dart_project
+cat > .gitignore <<'EOF'
+myenv/
+__pycache__/
+report_*/
+*.xlsx
+*.csv
+EOF
