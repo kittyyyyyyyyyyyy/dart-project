@@ -1,19 +1,17 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>DART 다운로드</title>
+  <title>DART 데이터 다운로드</title>
 </head>
 <body>
+  <h1>DART 데이터 다운로드</h1>
 
-<h2>기업지배구조보고서 다운로드</h2>
+  <button onclick="download()">엑셀 다운로드</button>
 
-<button onclick="download()">엑셀 다운로드</button>
-
-<script>
-function download() {
-    window.location.href = "http://127.0.0.1:8000/download";
-}
-</script>
-
+  <script>
+    function download() {
+      window.location.href = "/download";
+    }
+  </script>
 </body>
 </html>
