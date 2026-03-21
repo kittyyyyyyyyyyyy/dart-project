@@ -3,7 +3,15 @@ import zipfile
 import io
 import os
 
-API_KEY = "6407c0f8de0092ecfb83f23d01c12da28f7cfd61"
+from dotenv import load_dotenv
+
+load_dotenv()
+
+API_KEY = os.getenv("DART_API_KEY")
+
+if not API_KEY:
+    raise ValueError("DART_API_KEY가 없습니다. .env 파일을 확인하세요.")
+
 RCEPT_NO = "20250602800223"
 
 def download_report(rcept_no):

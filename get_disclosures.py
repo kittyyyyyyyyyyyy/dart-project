@@ -2,7 +2,15 @@ import requests
 import pandas as pd
 import time
 
-API_KEY = "6407c0f8de0092ecfb83f23d01c12da28f7cfd61"
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+API_KEY = os.getenv("DART_API_KEY")
+
+if not API_KEY:
+    raise ValueError("DART_API_KEY가 없습니다. .env 파일을 확인하세요.")
 
 def get_reports(start, end, corp_cls):
     url = "https://opendart.fss.or.kr/api/list.json"
