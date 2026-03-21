@@ -15,6 +15,15 @@ def root():
 def page():
     return FileResponse("index.html")
 
+@app.get("/env-check")
+def env_check():
+    import os
+    value = os.getenv("DART_API_KEY")
+    return {
+        "has_key": bool(value),
+        "prefix": value[:5] if value else None
+    }    
+
 @app.get("/download")
 def download_excel():
     try:
@@ -63,11 +72,3 @@ def download_excel():
             content={"error": str(e)}
         )
 
-        @app.get("/env-check")
-def env_check():
-    import os
-    value = os.getenv("DART_API_KEY")
-    return {
-        "has_key": bool(value),
-        "prefix": value[:5] if value else None
-    }
