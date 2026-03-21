@@ -1,5 +1,5 @@
 from fastapi import FastAPI
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 import subprocess
 import os
 
@@ -7,33 +7,58 @@ app = FastAPI()
 
 FILE_NAME = "all_table_1_2_2.xlsx"
 
-# 1️⃣ 기본 확인용 (서버 살아있는지)
 @app.get("/")
 def root():
     return {"message": "server running"}
 
-# 2️⃣ 웹페이지 (버튼 화면)
 @app.get("/page")
 def page():
     return FileResponse("index.html")
 
-# 3️⃣ 엑셀 다운로드 API
 @app.get("/download")
 def download_excel():
-    # 기존 파일 있으면 삭제
-    if os.path.exists(FILE_NAME):
-        os.remove(FILE_NAME)
+    try:
+        # 기존 파일 삭제
+        if os.path.exists(FILE_NAME):
+            os.remove(FILE_NAME)
 
-    # 데이터 생성 실행
-    subprocess.run(["python3", "extract_all_cg_tables.py"], check=True)
+        # 데이터 생성 실행
+        result = subprocess.run(
+            ["python3", "extract_all_cg_tables.py"],
+            capture_output=True,
+            text=True
+        )
 
-    # 생성 실패 체크
-    if not os.path.exists(FILE_NAME):
-        return {"error": "excel generation failed"}
+        # 실행 실패 시 에러 내용 반환
+        if result.returncode != 0:
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "error": "extract_all_cg_tables.py 실행 실패",
+                    "stdout": result.stdout,
+                    "stderr": result.stderr
+                }
+            )
 
-    # 파일 다운로드
-    return FileResponse(
-        path=FILE_NAME,
-        filename=FILE_NAME,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+        # 파일 생성 확인
+        if not os.path.exists(FILE_NAME):
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "error": "엑셀 파일 생성 실패",
+                    "stdout": result.stdout,
+                    "stderr": result.stderr
+                }
+            )
+
+        return FileResponse(
+            path=FILE_NAME,
+            filename=FILE_NAME,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
