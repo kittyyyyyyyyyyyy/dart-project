@@ -6,6 +6,9 @@ import time
 import shutil
 import zipfile
 import argparse
+import subprocess
+import sys
+from pathlib import Path
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -18,10 +21,45 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 
 load_dotenv()
 API_KEY = os.getenv("DART_API_KEY")
-os.environ["PLAYWRIGHT_BROWSERS_PATH"] = os.getenv("PLAYWRIGHT_BROWSERS_PATH", "/app/pw-browsers")
 
 if not API_KEY:
     raise ValueError("DART_API_KEY가 없습니다. 환경 변수를 확인하세요.")
+
+# Playwright 브라우저를 /tmp 아래에 강제 설치/사용
+PLAYWRIGHT_DIR = "/tmp/pw-browsers"
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = PLAYWRIGHT_DIR
+
+
+def ensure_playwright_browser():
+    """
+    /tmp/pw-browsers 안에 chromium이 없으면 런타임에서 직접 설치
+    """
+    base = Path(PLAYWRIGHT_DIR)
+    base.mkdir(parents=True, exist_ok=True)
+
+    # chromium 실행 파일 후보들
+    candidates = list(base.glob("chromium-*/chrome-linux/chrome")) + \
+                 list(base.glob("chromium_headless_shell-*/chrome-linux/headless_shell"))
+
+    if candidates:
+        return str(candidates[0])
+
+    env = os.environ.copy()
+    env["PLAYWRIGHT_BROWSERS_PATH"] = PLAYWRIGHT_DIR
+
+    subprocess.run(
+        [sys.executable, "-m", "playwright", "install", "chromium"],
+        check=True,
+        env=env
+    )
+
+    candidates = list(base.glob("chromium-*/chrome-linux/chrome")) + \
+                 list(base.glob("chromium_headless_shell-*/chrome-linux/headless_shell"))
+
+    if not candidates:
+        raise RuntimeError("Playwright chromium 설치 후에도 실행 파일을 찾지 못했습니다.")
+
+    return str(candidates[0])
 
 
 def make_session():
@@ -97,7 +135,6 @@ def setup_nps_search(page, start_date, end_date, company_keyword=""):
     if len(text_like_inputs) < 3:
         raise RuntimeError("국민연금 검색 입력창을 찾지 못했습니다.")
 
-    # 회사명, 시작일, 종료일 순으로 가정
     company_input = text_like_inputs[0]
     start_input = text_like_inputs[1]
     end_input = text_like_inputs[2]
@@ -125,7 +162,6 @@ def go_to_page(page, target_page):
     if target_page == 1:
         return
 
-    # 페이지 숫자 링크가 안 보이면 "다음"을 눌러 pager block 이동
     safety = 0
     while safety < 30:
         safety += 1
@@ -145,7 +181,6 @@ def go_to_page(page, target_page):
         if found:
             return
 
-        # 없으면 다음 블록으로
         next_clicked = False
         for i in range(link_count):
             txt = safe_text(page_links.nth(i)).strip()
@@ -191,7 +226,6 @@ def collect_rows_on_current_page(page, company_names=None):
         if company_set and corp_name not in company_set:
             continue
 
-        # 회사명 링크
         link = tr.locator("a").first
         if link.count() == 0:
             continue
@@ -201,8 +235,7 @@ def collect_rows_on_current_page(page, company_names=None):
             "corp_name": corp_name,
             "stock_code": stock_code,
             "meeting_date": meeting_date,
-            "category": category,
-            "row_index": i
+            "category": category
         })
 
     return items
@@ -214,15 +247,14 @@ def parse_detail_table_from_page(page):
     if table_count == 0:
         return []
 
-    best_rows = []
     best_table = None
+    best_size = 0
 
     for i in range(table_count):
         tb = tables.nth(i)
-        rows = tb.locator("tr")
-        rc = rows.count()
-        if rc > len(best_rows):
-            best_rows = list(range(rc))
+        rc = tb.locator("tr").count()
+        if rc > best_size:
+            best_size = rc
             best_table = tb
 
     if best_table is None:
@@ -248,7 +280,6 @@ def parse_detail_table_from_page(page):
     if len(parsed_rows) < 2:
         return []
 
-    # 첫 줄 헤더 제거
     data_rows = parsed_rows[1:]
 
     normalized = []
@@ -268,8 +299,11 @@ def fetch_nps_vote_list_and_details(start_date, end_date, company_names=None, pr
     results = []
     fail_rows = []
 
+    browser_executable = ensure_playwright_browser()
+
     with sync_playwright() as p:
         browser = p.chromium.launch(
+            executable_path=browser_executable,
             headless=True,
             args=["--no-sandbox", "--disable-dev-shm-usage"]
         )
@@ -278,7 +312,6 @@ def fetch_nps_vote_list_and_details(start_date, end_date, company_names=None, pr
 
         write_progress(progress_file, "running", 3, "국민연금 목록 검색 중...")
 
-        # 전부/선택에 따라 회사명 검색칸은 비워두고 전체 검색 후 필터링
         setup_nps_search(page, start_date, end_date, company_keyword="")
 
         total_count = get_total_count(page)
@@ -312,7 +345,6 @@ def fetch_nps_vote_list_and_details(start_date, end_date, company_names=None, pr
             page_items = collect_rows_on_current_page(page, company_names=company_names)
             all_items.extend(page_items)
 
-        # 중복 제거
         dedup = {}
         for item in all_items:
             key = (item["corp_name"], item["stock_code"], item["meeting_date"])
@@ -324,7 +356,6 @@ def fetch_nps_vote_list_and_details(start_date, end_date, company_names=None, pr
             browser.close()
             return [], [["", "", "", "nps_list_empty"]]
 
-        # 상세 수집
         for idx, item in enumerate(all_items, start=1):
             corp_name = item["corp_name"]
             stock_code = item["stock_code"]
@@ -341,12 +372,9 @@ def fetch_nps_vote_list_and_details(start_date, end_date, company_names=None, pr
             )
 
             try:
-                # 다시 검색 화면 진입 후 해당 페이지 이동
                 setup_nps_search(page, start_date, end_date, company_keyword="")
-
                 page.wait_for_timeout(1000)
 
-                # 현재 아이템이 어느 페이지에 있는지 다시 찾아야 하므로 전 페이지를 탐색
                 found = False
                 for page_no in range(1, total_pages + 1):
                     if page_no > 1:
@@ -380,7 +408,7 @@ def fetch_nps_vote_list_and_details(start_date, end_date, company_names=None, pr
                             link = tr.locator("a").first
                             link.click()
                             page.wait_for_load_state("domcontentloaded")
-                            page.wait_for_timeout(1200)
+                            page.wait_for_timeout(1500)
 
                             detail_rows = parse_detail_table_from_page(page)
                             if not detail_rows:
@@ -585,7 +613,6 @@ def main():
         write_progress(progress_file, "done", 100, "완료", 0, 0)
         return
 
-    # 회사/주총일 단위로 묶어서 DART 매칭
     grouped = {}
     for row in nps_rows:
         key = (row["corp_name"], row["stock_code"], row["meeting_date"])
