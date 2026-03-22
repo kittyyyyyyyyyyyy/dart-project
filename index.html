@@ -2,17 +2,28 @@
 <html>
 <head>
   <meta charset="UTF-8">
-  <title>~2025 정기주주총회 결과 및 찬반률(기업지배구조보고서)</title>
+  <title>공시 다운로드</title>
   <style>
     body {
       font-family: Arial, sans-serif;
-      max-width: 900px;
+      max-width: 980px;
       margin: 40px auto;
       line-height: 1.5;
     }
 
     h1 {
       margin-bottom: 24px;
+    }
+
+    h2 {
+      margin-top: 40px;
+      margin-bottom: 18px;
+      padding-bottom: 8px;
+      border-bottom: 2px solid #ddd;
+    }
+
+    .section {
+      margin-bottom: 50px;
     }
 
     .field {
@@ -133,83 +144,149 @@
   </style>
 </head>
 <body>
-  <h1>~2025 정기주주총회 결과 및 찬반률(기업지배구조보고서)</h1>
+  <div class="section">
+    <h2>~2025 정기주주총회 결과 및 찬반률(기업지배구조보고서)</h2>
 
-  <div class="field">
-    <label>시작일</label><br>
-    <input type="date" id="startDate">
-  </div>
-
-  <div class="field">
-    <label>종료일</label><br>
-    <input type="date" id="endDate">
-  </div>
-
-  <div class="field">
-    <label>회사 선택 방식</label><br>
-    <select id="companyMode" onchange="toggleCompanyMode()">
-      <option value="all" selected>전부</option>
-      <option value="select">선택</option>
-    </select>
-  </div>
-
-  <div id="companySelectArea" class="field hidden">
-    <label>회사명 선택</label>
-    <div class="hint">검색 후 추천 목록에서 선택하고, + 버튼으로 여러 회사를 추가하세요.</div>
-
-    <div class="row" style="margin-top: 8px;">
-      <input type="text" id="companySearch" placeholder="회사명을 입력하세요">
-      <button type="button" onclick="addSelectedCompany()">+</button>
+    <div class="field">
+      <label>시작일</label><br>
+      <input type="date" id="cgStartDate">
     </div>
 
-    <div id="suggestions" class="suggestions"></div>
-    <div id="selectedCompanies" class="chips"></div>
-  </div>
-
-  <button id="downloadBtn" onclick="startDownload()">엑셀 다운로드</button>
-
-  <div class="progress-wrap" id="progressWrap">
-    <div class="progress-bar-bg">
-      <div class="progress-bar-fill" id="progressFill"></div>
+    <div class="field">
+      <label>종료일</label><br>
+      <input type="date" id="cgEndDate">
     </div>
-    <div class="progress-text" id="progressText">대기 중...</div>
+
+    <div class="field">
+      <label>회사 선택 방식</label><br>
+      <select id="cgCompanyMode" onchange="toggleCompanyMode('cg')">
+        <option value="all" selected>전부</option>
+        <option value="select">선택</option>
+      </select>
+    </div>
+
+    <div id="cgCompanySelectArea" class="field hidden">
+      <label>회사명 선택</label>
+      <div class="hint">검색 후 추천 목록에서 선택하고, + 버튼으로 여러 회사를 추가하세요.</div>
+
+      <div class="row" style="margin-top: 8px;">
+        <input type="text" id="cgCompanySearch" placeholder="회사명을 입력하세요">
+        <button type="button" onclick="addSelectedCompany('cg')">+</button>
+      </div>
+
+      <div id="cgSuggestions" class="suggestions"></div>
+      <div id="cgSelectedCompanies" class="chips"></div>
+    </div>
+
+    <button onclick="startDownload('cg')">엑셀 다운로드</button>
+
+    <div class="progress-wrap" id="cgProgressWrap">
+      <div class="progress-bar-bg">
+        <div class="progress-bar-fill" id="cgProgressFill"></div>
+      </div>
+      <div class="progress-text" id="cgProgressText">대기 중...</div>
+    </div>
+
+    <div class="error-box" id="cgErrorBox"></div>
   </div>
 
-  <div class="error-box" id="errorBox"></div>
+  <div class="section">
+    <h2>2026~ 정기주주총회 결과 및 찬반률(정기주주총회결과)</h2>
+
+    <div class="field">
+      <label>시작일</label><br>
+      <input type="date" id="rmStartDate">
+    </div>
+
+    <div class="field">
+      <label>종료일</label><br>
+      <input type="date" id="rmEndDate">
+    </div>
+
+    <div class="field">
+      <label>회사 선택 방식</label><br>
+      <select id="rmCompanyMode" onchange="toggleCompanyMode('rm')">
+        <option value="all" selected>전부</option>
+        <option value="select">선택</option>
+      </select>
+    </div>
+
+    <div id="rmCompanySelectArea" class="field hidden">
+      <label>회사명 선택</label>
+      <div class="hint">검색 후 추천 목록에서 선택하고, + 버튼으로 여러 회사를 추가하세요.</div>
+
+      <div class="row" style="margin-top: 8px;">
+        <input type="text" id="rmCompanySearch" placeholder="회사명을 입력하세요">
+        <button type="button" onclick="addSelectedCompany('rm')">+</button>
+      </div>
+
+      <div id="rmSuggestions" class="suggestions"></div>
+      <div id="rmSelectedCompanies" class="chips"></div>
+    </div>
+
+    <button onclick="startDownload('rm')">엑셀 다운로드</button>
+
+    <div class="progress-wrap" id="rmProgressWrap">
+      <div class="progress-bar-bg">
+        <div class="progress-bar-fill" id="rmProgressFill"></div>
+      </div>
+      <div class="progress-text" id="rmProgressText">대기 중...</div>
+    </div>
+
+    <div class="error-box" id="rmErrorBox"></div>
+  </div>
 
   <script>
-    let selectedCompanies = [];
-    let selectedSuggestion = null;
-    let pollTimer = null;
-    let suggestionTimer = null;
+    const state = {
+      cg: {
+        selectedCompanies: [],
+        selectedSuggestion: null,
+        pollTimer: null,
+        suggestionTimer: null
+      },
+      rm: {
+        selectedCompanies: [],
+        selectedSuggestion: null,
+        pollTimer: null,
+        suggestionTimer: null
+      }
+    };
 
-    function setDateMaxToday() {
+    function setDateRanges() {
       const today = new Date().toISOString().split("T")[0];
-      document.getElementById("startDate").max = today;
-      document.getElementById("endDate").max = today;
+
+      // 기업지배구조보고서
+      document.getElementById("cgStartDate").max = today;
+      document.getElementById("cgEndDate").max = today;
+
+      // 정기주주총회결과
+      document.getElementById("rmStartDate").min = "2026-01-01";
+      document.getElementById("rmEndDate").min = "2026-01-01";
+      document.getElementById("rmStartDate").max = today;
+      document.getElementById("rmEndDate").max = today;
     }
 
-    function toggleCompanyMode() {
-      const mode = document.getElementById("companyMode").value;
-      const area = document.getElementById("companySelectArea");
+    function toggleCompanyMode(prefix) {
+      const mode = document.getElementById(`${prefix}CompanyMode`).value;
+      const area = document.getElementById(`${prefix}CompanySelectArea`);
 
       if (mode === "select") {
         area.classList.remove("hidden");
       } else {
         area.classList.add("hidden");
-        selectedCompanies = [];
-        selectedSuggestion = null;
-        document.getElementById("companySearch").value = "";
-        document.getElementById("suggestions").style.display = "none";
-        renderSelectedCompanies();
+        state[prefix].selectedCompanies = [];
+        state[prefix].selectedSuggestion = null;
+        document.getElementById(`${prefix}CompanySearch`).value = "";
+        document.getElementById(`${prefix}Suggestions`).style.display = "none";
+        renderSelectedCompanies(prefix);
       }
     }
 
-    function renderSelectedCompanies() {
-      const container = document.getElementById("selectedCompanies");
+    function renderSelectedCompanies(prefix) {
+      const container = document.getElementById(`${prefix}SelectedCompanies`);
       container.innerHTML = "";
 
-      selectedCompanies.forEach((company) => {
+      state[prefix].selectedCompanies.forEach((company) => {
         const chip = document.createElement("div");
         chip.className = "chip";
 
@@ -218,7 +295,7 @@
 
         const btn = document.createElement("button");
         btn.textContent = "×";
-        btn.onclick = () => removeCompany(company);
+        btn.onclick = () => removeCompany(prefix, company);
 
         chip.appendChild(text);
         chip.appendChild(btn);
@@ -226,16 +303,16 @@
       });
     }
 
-    function removeCompany(company) {
-      selectedCompanies = selectedCompanies.filter(c => c !== company);
-      renderSelectedCompanies();
+    function removeCompany(prefix, company) {
+      state[prefix].selectedCompanies = state[prefix].selectedCompanies.filter(c => c !== company);
+      renderSelectedCompanies(prefix);
     }
 
-    async function fetchSuggestions() {
-      const q = document.getElementById("companySearch").value.trim();
-      const suggestionsBox = document.getElementById("suggestions");
+    async function fetchSuggestions(prefix) {
+      const q = document.getElementById(`${prefix}CompanySearch`).value.trim();
+      const suggestionsBox = document.getElementById(`${prefix}Suggestions`);
 
-      selectedSuggestion = null;
+      state[prefix].selectedSuggestion = null;
       suggestionsBox.innerHTML = "";
 
       if (q.length < 1) {
@@ -254,14 +331,14 @@
         }
 
         data.companies.forEach((company) => {
-          if (selectedCompanies.includes(company)) return;
+          if (state[prefix].selectedCompanies.includes(company)) return;
 
           const div = document.createElement("div");
           div.className = "suggestion-item";
           div.textContent = company;
           div.onclick = () => {
-            selectedSuggestion = company;
-            document.getElementById("companySearch").value = company;
+            state[prefix].selectedSuggestion = company;
+            document.getElementById(`${prefix}CompanySearch`).value = company;
             suggestionsBox.style.display = "none";
           };
           suggestionsBox.appendChild(div);
@@ -273,8 +350,8 @@
       }
     }
 
-    function addSelectedCompany() {
-      const input = document.getElementById("companySearch");
+    function addSelectedCompany(prefix) {
+      const input = document.getElementById(`${prefix}CompanySearch`);
       const value = input.value.trim();
 
       if (!value) {
@@ -282,35 +359,39 @@
         return;
       }
 
-      if (!selectedSuggestion || selectedSuggestion !== value) {
+      if (!state[prefix].selectedSuggestion || state[prefix].selectedSuggestion !== value) {
         alert("추천 목록에서 실제 존재하는 회사명을 선택한 뒤 + 버튼을 눌러주세요.");
         return;
       }
 
-      if (!selectedCompanies.includes(value)) {
-        selectedCompanies.push(value);
+      if (!state[prefix].selectedCompanies.includes(value)) {
+        state[prefix].selectedCompanies.push(value);
       }
 
       input.value = "";
-      selectedSuggestion = null;
-      document.getElementById("suggestions").style.display = "none";
-      renderSelectedCompanies();
+      state[prefix].selectedSuggestion = null;
+      document.getElementById(`${prefix}Suggestions`).style.display = "none";
+      renderSelectedCompanies(prefix);
     }
 
-    document.getElementById("companySearch").addEventListener("input", () => {
-      selectedSuggestion = null;
-      clearTimeout(suggestionTimer);
-      suggestionTimer = setTimeout(fetchSuggestions, 300);
-    });
+    function attachSearchListener(prefix) {
+      document.getElementById(`${prefix}CompanySearch`).addEventListener("input", () => {
+        state[prefix].selectedSuggestion = null;
+        clearTimeout(state[prefix].suggestionTimer);
+        state[prefix].suggestionTimer = setTimeout(() => fetchSuggestions(prefix), 300);
+      });
+    }
 
-    async function startDownload() {
-      const startDate = document.getElementById("startDate").value;
-      const endDate = document.getElementById("endDate").value;
-      const companyMode = document.getElementById("companyMode").value;
-      const errorBox = document.getElementById("errorBox");
-      const progressWrap = document.getElementById("progressWrap");
-      const progressFill = document.getElementById("progressFill");
-      const progressText = document.getElementById("progressText");
+    async function startDownload(prefix) {
+      const isCg = prefix === "cg";
+
+      const startDate = document.getElementById(`${prefix}StartDate`).value;
+      const endDate = document.getElementById(`${prefix}EndDate`).value;
+      const companyMode = document.getElementById(`${prefix}CompanyMode`).value;
+      const errorBox = document.getElementById(`${prefix}ErrorBox`);
+      const progressWrap = document.getElementById(`${prefix}ProgressWrap`);
+      const progressFill = document.getElementById(`${prefix}ProgressFill`);
+      const progressText = document.getElementById(`${prefix}ProgressText`);
 
       errorBox.textContent = "";
 
@@ -324,7 +405,7 @@
         return;
       }
 
-      if (companyMode === "select" && selectedCompanies.length === 0) {
+      if (companyMode === "select" && state[prefix].selectedCompanies.length === 0) {
         alert("회사를 하나 이상 추가하세요.");
         return;
       }
@@ -336,11 +417,13 @@
       const payload = {
         start_date: startDate,
         end_date: endDate,
-        companies: companyMode === "all" ? [] : selectedCompanies
+        companies: companyMode === "all" ? [] : state[prefix].selectedCompanies
       };
 
+      const apiUrl = isCg ? "/start-download" : "/start-regular-download";
+
       try {
-        const res = await fetch("/start-download", {
+        const res = await fetch(apiUrl, {
           method: "POST",
           headers: {
             "Content-Type": "application/json"
@@ -357,11 +440,11 @@
 
         const jobId = data.job_id;
 
-        if (pollTimer) {
-          clearInterval(pollTimer);
+        if (state[prefix].pollTimer) {
+          clearInterval(state[prefix].pollTimer);
         }
 
-        pollTimer = setInterval(async () => {
+        state[prefix].pollTimer = setInterval(async () => {
           const statusRes = await fetch(`/job-status/${jobId}`);
           const status = await statusRes.json();
 
@@ -371,14 +454,14 @@
           }
 
           if (status.state === "done") {
-            clearInterval(pollTimer);
+            clearInterval(state[prefix].pollTimer);
             progressFill.style.width = "100%";
             progressText.textContent = "완료! 다운로드를 시작합니다.";
             window.location.href = status.download_url;
           }
 
           if (status.state === "error") {
-            clearInterval(pollTimer);
+            clearInterval(state[prefix].pollTimer);
             errorBox.textContent =
               (status.error || "오류 발생") +
               "\n\nstdout:\n" + (status.stdout || "") +
@@ -392,7 +475,9 @@
       }
     }
 
-    setDateMaxToday();
+    setDateRanges();
+    attachSearchListener("cg");
+    attachSearchListener("rm");
   </script>
 </body>
 </html>
