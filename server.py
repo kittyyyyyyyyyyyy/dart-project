@@ -7,85 +7,79 @@ import uuid
 import json
 import threading
 import time
-from datetime import datetime, timedelta
-from functools import lru_cache
 import requests
+import zipfile
+import io
+import xml.etree.ElementTree as ET
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 app = FastAPI()
 
 API_KEY = os.getenv("DART_API_KEY")
 jobs = {}
 
-
-def chunk_date_ranges(start_date_str, end_date_str, chunk_days=90):
-    start = datetime.strptime(start_date_str, "%Y-%m-%d")
-    end = datetime.strptime(end_date_str, "%Y-%m-%d")
-
-    ranges = []
-    current = start
-
-    while current <= end:
-        chunk_end = min(current + timedelta(days=chunk_days - 1), end)
-        ranges.append(
-            (
-                current.strftime("%Y%m%d"),
-                chunk_end.strftime("%Y%m%d")
-            )
-        )
-        current = chunk_end + timedelta(days=1)
-
-    return ranges
+company_cache = {
+    "loaded_at": 0,
+    "names": []
+}
 
 
-@lru_cache(maxsize=32)
-def cached_company_names(start_date: str, end_date: str):
+def make_session():
+    session = requests.Session()
+    retry = Retry(
+        total=5,
+        connect=5,
+        read=5,
+        backoff_factor=1.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"]
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+http = make_session()
+
+
+def load_all_company_names():
+    """
+    OpenDART corpCode.xml 기반 전체 회사명 로드
+    12시간 캐시
+    """
+    now = time.time()
+    if company_cache["names"] and (now - company_cache["loaded_at"] < 60 * 60 * 12):
+        return company_cache["names"]
+
     if not API_KEY:
-        return tuple()
+        return []
 
-    url = "https://opendart.fss.or.kr/api/list.json"
+    url = "https://opendart.fss.or.kr/api/corpCode.xml"
+    params = {"crtfc_key": API_KEY}
+
+    res = http.get(url, params=params, timeout=(20, 120))
+    z = zipfile.ZipFile(io.BytesIO(res.content))
+
+    xml_filename = z.namelist()[0]
+    xml_content = z.read(xml_filename)
+
+    root = ET.fromstring(xml_content)
+
     names = set()
+    for item in root.findall("list"):
+        corp_name = item.findtext("corp_name", default="").strip()
+        stock_code = item.findtext("stock_code", default="").strip()
 
-    for bgn_de, end_de in chunk_date_ranges(start_date, end_date):
-        for corp_cls in ["Y", "K"]:
-            page_no = 1
+        # 상장사 중심으로 추천
+        if corp_name and stock_code:
+            names.add(corp_name)
 
-            while True:
-                params = {
-                    "crtfc_key": API_KEY,
-                    "bgn_de": bgn_de,
-                    "end_de": end_de,
-                    "corp_cls": corp_cls,
-                    "page_no": page_no,
-                    "page_count": 100,
-                    "sort": "date",
-                    "sort_mth": "desc"
-                }
-
-                res = requests.get(url, params=params, timeout=60)
-                data = res.json()
-
-                if data.get("status") != "000":
-                    break
-
-                items = data.get("list", [])
-                if not items:
-                    break
-
-                for item in items:
-                    report_nm = str(item.get("report_nm", ""))
-                    if "기업지배구조보고서" not in report_nm:
-                        continue
-                    corp_name = str(item.get("corp_name", ""))
-                    if corp_name:
-                        names.add(corp_name)
-
-                if len(items) < 100:
-                    break
-
-                page_no += 1
-                time.sleep(0.1)
-
-    return tuple(sorted(names))
+    result = sorted(names)
+    company_cache["loaded_at"] = now
+    company_cache["names"] = result
+    return result
 
 
 class DownloadRequest(BaseModel):
@@ -127,18 +121,25 @@ def env_check():
 
 
 @app.get("/company-suggestions")
-def company_suggestions(
-    start_date: str = Query(...),
-    end_date: str = Query(...),
-    q: str = Query(...)
-):
-    if not q.strip():
+def company_suggestions(q: str = Query(...)):
+    keyword = q.strip()
+    if not keyword:
         return {"companies": []}
 
-    all_names = cached_company_names(start_date, end_date)
-    q_lower = q.strip().lower()
+    all_names = load_all_company_names()
+    q_lower = keyword.lower()
 
-    matched = [name for name in all_names if q_lower in name.lower()][:20]
+    starts = []
+    contains = []
+
+    for name in all_names:
+        lower_name = name.lower()
+        if lower_name.startswith(q_lower):
+            starts.append(name)
+        elif q_lower in lower_name:
+            contains.append(name)
+
+    matched = (starts + contains)[:20]
     return {"companies": matched}
 
 

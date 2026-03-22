@@ -11,6 +11,8 @@ import argparse
 from datetime import datetime, timedelta
 import json
 import re
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 load_dotenv()
 
@@ -18,6 +20,25 @@ API_KEY = os.getenv("DART_API_KEY")
 
 if not API_KEY:
     raise ValueError("DART_API_KEY가 없습니다. .env 또는 환경 변수를 확인하세요.")
+
+
+def make_session():
+    session = requests.Session()
+    retry = Retry(
+        total=5,
+        connect=5,
+        read=5,
+        backoff_factor=1.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"]
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+http = make_session()
 
 
 def write_progress(progress_file, status, percent, message, current=0, total=0):
@@ -54,6 +75,10 @@ def chunk_date_ranges(start_date_str, end_date_str, chunk_days=90):
         current = chunk_end + timedelta(days=1)
 
     return ranges
+
+
+def safe_get(url, params):
+    return http.get(url, params=params, timeout=(20, 120))
 
 
 def fetch_latest_reports(start_date, end_date, company_names=None, progress_file=None):
@@ -94,7 +119,7 @@ def fetch_latest_reports(start_date, end_date, company_names=None, progress_file
                     "sort_mth": "desc"
                 }
 
-                res = requests.get(url, params=params, timeout=60)
+                res = safe_get(url, params)
                 data = res.json()
 
                 status = data.get("status")
@@ -117,11 +142,20 @@ def fetch_latest_reports(start_date, end_date, company_names=None, progress_file
 
                     all_results.append(item)
 
+                write_progress(
+                    progress_file,
+                    "running",
+                    approx_percent,
+                    f"공시 검색 중... ({bgn_de}~{end_de}, 시장 {corp_cls}, page {page_no})",
+                    step,
+                    total_steps
+                )
+
                 if len(items) < 100:
                     break
 
                 page_no += 1
-                time.sleep(0.15)
+                time.sleep(0.12)
 
     dedup = {}
     for item in all_results:
@@ -137,7 +171,7 @@ def download_report(rcept_no):
         "rcept_no": str(rcept_no)
     }
 
-    response = requests.get(url, params=params, timeout=60)
+    response = safe_get(url, params)
 
     folder_name = f"report_{rcept_no}"
 
@@ -204,11 +238,6 @@ def extract_table_rows(file_path):
 
 
 def select_target_group_rows(table_rows):
-    """
-    새 기준:
-    1) col_1에 반드시 '정기' 포함
-    2) '25기', '26기'처럼 숫자가 다르면 더 큰 숫자 그룹만 선택
-    """
     if not table_rows or len(table_rows) < 2:
         return []
 
@@ -221,46 +250,46 @@ def select_target_group_rows(table_rows):
     current_rows = []
 
     for row in data_rows:
-      if not row:
-        continue
+        if not row:
+            continue
 
-      key = row[0].strip() if len(row) > 0 else ""
+        key = row[0].strip() if len(row) > 0 else ""
 
-      if current_key is None:
-        current_key = key
-        current_rows = [row]
-      elif key == current_key:
-        current_rows.append(row)
-      else:
-        groups.append((current_key, current_rows))
-        current_key = key
-        current_rows = [row]
+        if current_key is None:
+            current_key = key
+            current_rows = [row]
+        elif key == current_key:
+            current_rows.append(row)
+        else:
+            groups.append((current_key, current_rows))
+            current_key = key
+            current_rows = [row]
 
     if current_rows:
-      groups.append((current_key, current_rows))
+        groups.append((current_key, current_rows))
 
     candidates = []
 
     for key, rows in groups:
-      if "정기" not in key:
-        continue
+        if "정기" not in key:
+            continue
 
-      m = re.search(r"(\d+)\s*기", key)
-      period_num = int(m.group(1)) if m else -1
+        m = re.search(r"(\d+)\s*기", key)
+        period_num = int(m.group(1)) if m else -1
 
-      candidates.append({
-        "key": key,
-        "rows": rows,
-        "period_num": period_num
-      })
+        candidates.append({
+            "key": key,
+            "rows": rows,
+            "period_num": period_num
+        })
 
     if not candidates:
-      return []
+        return []
 
     numeric_candidates = [c for c in candidates if c["period_num"] >= 0]
     if numeric_candidates:
-      best = max(numeric_candidates, key=lambda x: x["period_num"])
-      return best["rows"]
+        best = max(numeric_candidates, key=lambda x: x["period_num"])
+        return best["rows"]
 
     return candidates[0]["rows"]
 
@@ -372,7 +401,7 @@ def main():
         finally:
             shutil.rmtree(folder_name, ignore_errors=True)
 
-        time.sleep(0.1)
+        time.sleep(0.08)
 
     result_df = pd.DataFrame(all_rows)
     fail_df = pd.DataFrame(fail_list, columns=["corp_name", "stock_code", "rcept_no", "reason"])
