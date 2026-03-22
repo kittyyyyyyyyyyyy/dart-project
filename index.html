@@ -288,9 +288,6 @@
       nps: { selectedCompanies: [], selectedSuggestion: null, pollTimer: null, suggestionTimer: null }
     };
 
-    let companyDataset = [];
-    let companyDatasetLower = [];
-
     function setDateRanges() {
       const today = new Date().toISOString().split("T")[0];
 
@@ -302,19 +299,9 @@
       document.getElementById("rmStartDate").max = today;
       document.getElementById("rmEndDate").max = today;
 
-  
-    }
-
-    async function preloadCompanyDataset() {
-      try {
-        const res = await fetch("/company-suggestions-data");
-        const data = await res.json();
-        companyDataset = data.companies || [];
-        companyDatasetLower = companyDataset.map(name => name.toLowerCase());
-      } catch (e) {
-        companyDataset = [];
-        companyDatasetLower = [];
-      }
+      // 국민연금은 미래 종료일 허용: max 설정하지 않음
+      // document.getElementById("npsStartDate").max = today;
+      // document.getElementById("npsEndDate").max = today;
     }
 
     function toggleCompanyMode(prefix) {
@@ -360,30 +347,7 @@
       renderSelectedCompanies(prefix);
     }
 
-    function getLocalSuggestions(keyword) {
-      const q = keyword.toLowerCase();
-      const starts = [];
-      const contains = [];
-
-      for (let i = 0; i < companyDataset.length; i++) {
-        const original = companyDataset[i];
-        const lower = companyDatasetLower[i];
-
-        if (lower.startsWith(q)) {
-          starts.push(original);
-        } else if (lower.includes(q)) {
-          contains.push(original);
-        }
-
-        if (starts.length + contains.length >= 20) {
-          break;
-        }
-      }
-
-      return [...starts, ...contains].slice(0, 20);
-    }
-
-    function fetchSuggestions(prefix) {
+    async function fetchSuggestions(prefix) {
       const q = document.getElementById(`${prefix}CompanySearch`).value.trim();
       const suggestionsBox = document.getElementById(`${prefix}Suggestions`);
       const statusBox = document.getElementById(`${prefix}SuggestionStatus`);
@@ -399,33 +363,49 @@
 
       statusBox.textContent = "회사명 검색 중...";
 
-      const results = getLocalSuggestions(q);
+      try {
+        const res = await fetch(`/company-suggestions?q=${encodeURIComponent(q)}`);
+        const text = await res.text();
 
-      if (!results.length) {
-        suggestionsBox.style.display = "none";
-        statusBox.textContent = "일치하는 회사명이 없습니다.";
-        return;
-      }
-
-      results.forEach((company) => {
-        if (state[prefix].selectedCompanies.includes(company)) return;
-
-        const div = document.createElement("div");
-        div.className = "suggestion-item";
-        div.textContent = company;
-        div.onclick = () => {
-          state[prefix].selectedSuggestion = company;
-          document.getElementById(`${prefix}CompanySearch`).value = company;
+        let data = {};
+        try {
+          data = JSON.parse(text);
+        } catch (e) {
           suggestionsBox.style.display = "none";
-          statusBox.textContent = `선택됨: ${company}`;
-        };
-        suggestionsBox.appendChild(div);
-      });
+          statusBox.textContent = "회사명 추천 응답 해석 실패";
+          return;
+        }
 
-      suggestionsBox.style.display = suggestionsBox.children.length ? "block" : "none";
-      statusBox.textContent = suggestionsBox.children.length
-        ? "추천 목록에서 회사를 선택하세요."
-        : "일치하는 회사명이 없습니다.";
+        if (!data.companies || data.companies.length === 0) {
+          suggestionsBox.style.display = "none";
+          statusBox.textContent = "일치하는 회사명이 없습니다.";
+          return;
+        }
+
+        data.companies.forEach((company) => {
+          if (state[prefix].selectedCompanies.includes(company)) return;
+
+          const div = document.createElement("div");
+          div.className = "suggestion-item";
+          div.textContent = company;
+          div.onclick = () => {
+            state[prefix].selectedSuggestion = company;
+            document.getElementById(`${prefix}CompanySearch`).value = company;
+            suggestionsBox.style.display = "none";
+            statusBox.textContent = `선택됨: ${company}`;
+          };
+          suggestionsBox.appendChild(div);
+        });
+
+        suggestionsBox.style.display = suggestionsBox.children.length ? "block" : "none";
+        statusBox.textContent = suggestionsBox.children.length
+          ? "추천 목록에서 회사를 선택하세요."
+          : "일치하는 회사명이 없습니다.";
+
+      } catch (e) {
+        suggestionsBox.style.display = "none";
+        statusBox.textContent = "회사명 추천을 불러오지 못했습니다.";
+      }
     }
 
     function addSelectedCompany(prefix) {
@@ -460,7 +440,7 @@
       input.addEventListener("input", () => {
         state[prefix].selectedSuggestion = null;
         clearTimeout(state[prefix].suggestionTimer);
-        state[prefix].suggestionTimer = setTimeout(() => fetchSuggestions(prefix), 120);
+        state[prefix].suggestionTimer = setTimeout(() => fetchSuggestions(prefix), 180);
       });
 
       input.addEventListener("keydown", (e) => {
@@ -518,7 +498,16 @@
           body: JSON.stringify(payload)
         });
 
-        const data = await res.json();
+        const rawText = await res.text();
+
+        let data = {};
+        try {
+          data = JSON.parse(rawText);
+        } catch (e) {
+          errorBox.textContent =
+            "작업 시작 실패\n\n응답(JSON 아님):\n" + rawText;
+          return;
+        }
 
         if (!data.job_id) {
           errorBox.textContent =
@@ -534,7 +523,16 @@
 
         state[prefix].pollTimer = setInterval(async () => {
           const statusRes = await fetch(`/job-status/${jobId}`);
-          const status = await statusRes.json();
+          const statusText = await statusRes.text();
+
+          let status = {};
+          try {
+            status = JSON.parse(statusText);
+          } catch (e) {
+            errorBox.textContent = "상태 조회 실패\n\n응답:\n" + statusText;
+            clearInterval(state[prefix].pollTimer);
+            return;
+          }
 
           if (status.progress) {
             progressFill.style.width = `${status.progress.percent || 0}%`;
@@ -563,12 +561,11 @@
       }
     }
 
-    async function init() {
+    function init() {
       setDateRanges();
       attachSearchListener("cg");
       attachSearchListener("rm");
       attachSearchListener("nps");
-      await preloadCompanyDataset();
     }
 
     init();
