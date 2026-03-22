@@ -386,3 +386,41 @@ def download_file(job_id: str):
         filename=output_file,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
+
+    @app.post("/start-nps-download")
+def start_nps_download(payload: DownloadRequest):
+    job_id = str(uuid.uuid4())[:8]
+    output_file = f"nps_vote_result_{job_id}.xlsx"
+    progress_file = f"progress_nps_{job_id}.json"
+
+    args = [
+        "python3",
+        "generate_nps_vote_excel.py",
+        "--start-date", payload.start_date,
+        "--end-date", payload.end_date,
+        "--companies-json", json.dumps(payload.companies, ensure_ascii=False),
+        "--output", output_file,
+        "--progress-file", progress_file
+    ]
+
+    proc = subprocess.Popen(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+
+    jobs[job_id] = {
+        "process": proc,
+        "output_file": output_file,
+        "progress_file": progress_file,
+        "stdout": "",
+        "stderr": "",
+        "returncode": None,
+        "created_at": time.time()
+    }
+
+    t = threading.Thread(target=monitor_process, args=(job_id, proc), daemon=True)
+    t.start()
+
+    return {"job_id": job_id}
