@@ -313,11 +313,11 @@
       state[prefix].selectedSuggestion = null;
       suggestionsBox.innerHTML = "";
 
-      if (q.length < 1) {
-        suggestionsBox.style.display = "none";
-        statusBox.textContent = "";
-        return;
-      }
+      if (q.length < 2) {
+  suggestionsBox.style.display = "none";
+  statusBox.textContent = "두 글자 이상 입력하세요.";
+  return;
+}
 
       statusBox.textContent = "회사명 검색 중...";
 
@@ -390,7 +390,7 @@
       input.addEventListener("input", () => {
         state[prefix].selectedSuggestion = null;
         clearTimeout(state[prefix].suggestionTimer);
-        state[prefix].suggestionTimer = setTimeout(() => fetchSuggestions(prefix), 300);
+        state[prefix].suggestionTimer = setTimeout(() => fetchSuggestions(prefix), 180);
       });
 
       input.addEventListener("keydown", (e) => {
