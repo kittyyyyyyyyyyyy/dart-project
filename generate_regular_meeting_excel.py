@@ -81,8 +81,6 @@ def safe_get(url, params, max_attempts=4):
 
     for attempt in range(1, max_attempts + 1):
         try:
-            # connect timeout을 20 -> 60으로 증가
-            # read timeout도 120 -> 180으로 증가
             return http.get(url, params=params, timeout=(60, 180))
         except requests.exceptions.RequestException as e:
             last_error = e
@@ -99,7 +97,6 @@ def fetch_latest_reports(start_date, end_date, company_names=None, progress_file
     markets = ["Y", "K"]
     company_names_set = set(company_names or [])
 
-    # 90일 -> 30일로 줄여서 timeout 완화
     ranges = chunk_date_ranges(start_date, end_date, chunk_days=30)
     total_steps = max(1, len(ranges) * len(markets))
     step = 0
@@ -126,7 +123,6 @@ def fetch_latest_reports(start_date, end_date, company_names=None, progress_file
                     "end_de": end_de,
                     "corp_cls": corp_cls,
                     "page_no": page_no,
-                    # 100 -> 50으로 줄여서 부담 완화
                     "page_count": 50,
                     "sort": "date",
                     "sort_mth": "desc"
@@ -135,7 +131,7 @@ def fetch_latest_reports(start_date, end_date, company_names=None, progress_file
                 try:
                     res = safe_get(url, params)
                     data = res.json()
-                except requests.exceptions.RequestException as e:
+                except requests.exceptions.RequestException:
                     write_progress(
                         progress_file,
                         "running",
@@ -144,7 +140,6 @@ def fetch_latest_reports(start_date, end_date, company_names=None, progress_file
                         step,
                         total_steps
                     )
-                    # 이 구간/시장만 건너뛰고 다음으로 진행
                     break
 
                 status = data.get("status")
@@ -341,7 +336,15 @@ def main():
                 shutil.rmtree(folder_name, ignore_errors=True)
                 continue
 
-            for line_no, cols in enumerate(table_rows, start=1):
+            # 첫 줄 헤더 제거
+            data_rows = table_rows[1:]
+
+            if not data_rows:
+                fail_list.append([corp_name, stock_code, rcept_no, "no_data_after_header"])
+                shutil.rmtree(folder_name, ignore_errors=True)
+                continue
+
+            for line_no, cols in enumerate(data_rows, start=1):
                 row_dict = {
                     "corp_name": corp_name,
                     "stock_code": stock_code,

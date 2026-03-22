@@ -59,27 +59,32 @@ def load_all_company_names():
     url = "https://opendart.fss.or.kr/api/corpCode.xml"
     params = {"crtfc_key": API_KEY}
 
-    res = http.get(url, params=params, timeout=(20, 120))
-    z = zipfile.ZipFile(io.BytesIO(res.content))
+    try:
+        res = http.get(url, params=params, timeout=(60, 180))
+        z = zipfile.ZipFile(io.BytesIO(res.content))
 
-    xml_filename = z.namelist()[0]
-    xml_content = z.read(xml_filename)
+        xml_filename = z.namelist()[0]
+        xml_content = z.read(xml_filename)
 
-    root = ET.fromstring(xml_content)
+        root = ET.fromstring(xml_content)
 
-    names = set()
-    for item in root.findall("list"):
-        corp_name = item.findtext("corp_name", default="").strip()
-        stock_code = item.findtext("stock_code", default="").strip()
+        names = set()
+        for item in root.findall("list"):
+            corp_name = item.findtext("corp_name", default="").strip()
+            stock_code = item.findtext("stock_code", default="").strip()
 
-        # 상장사 중심으로 추천
-        if corp_name and stock_code:
-            names.add(corp_name)
+            # 상장사만 추천
+            if corp_name and stock_code:
+                names.add(corp_name)
 
-    result = sorted(names)
-    company_cache["loaded_at"] = now
-    company_cache["names"] = result
-    return result
+        result = sorted(names)
+        company_cache["loaded_at"] = now
+        company_cache["names"] = result
+        return result
+
+    except Exception as e:
+        print("회사명 목록 로드 실패:", str(e))
+        return company_cache["names"]
 
 
 class DownloadRequest(BaseModel):
@@ -140,7 +145,11 @@ def company_suggestions(q: str = Query(...)):
             contains.append(name)
 
     matched = (starts + contains)[:20]
-    return {"companies": matched}
+
+    return {
+        "companies": matched,
+        "count": len(matched)
+    }
 
 
 @app.post("/start-download")
@@ -152,6 +161,45 @@ def start_download(payload: DownloadRequest):
     args = [
         "python3",
         "generate_filtered_excel.py",
+        "--start-date", payload.start_date,
+        "--end-date", payload.end_date,
+        "--companies-json", json.dumps(payload.companies, ensure_ascii=False),
+        "--output", output_file,
+        "--progress-file", progress_file
+    ]
+
+    proc = subprocess.Popen(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+
+    jobs[job_id] = {
+        "process": proc,
+        "output_file": output_file,
+        "progress_file": progress_file,
+        "stdout": "",
+        "stderr": "",
+        "returncode": None,
+        "created_at": time.time()
+    }
+
+    t = threading.Thread(target=monitor_process, args=(job_id, proc), daemon=True)
+    t.start()
+
+    return {"job_id": job_id}
+
+
+@app.post("/start-regular-download")
+def start_regular_download(payload: DownloadRequest):
+    job_id = str(uuid.uuid4())[:8]
+    output_file = f"regular_meeting_result_{job_id}.xlsx"
+    progress_file = f"progress_regular_{job_id}.json"
+
+    args = [
+        "python3",
+        "generate_regular_meeting_excel.py",
         "--start-date", payload.start_date,
         "--end-date", payload.end_date,
         "--companies-json", json.dumps(payload.companies, ensure_ascii=False),
@@ -259,42 +307,3 @@ def download_file(job_id: str):
         filename=output_file,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
-
-
-@app.post("/start-regular-download")
-def start_regular_download(payload: DownloadRequest):
-    job_id = str(uuid.uuid4())[:8]
-    output_file = f"regular_meeting_result_{job_id}.xlsx"
-    progress_file = f"progress_regular_{job_id}.json"
-
-    args = [
-        "python3",
-        "generate_regular_meeting_excel.py",
-        "--start-date", payload.start_date,
-        "--end-date", payload.end_date,
-        "--companies-json", json.dumps(payload.companies, ensure_ascii=False),
-        "--output", output_file,
-        "--progress-file", progress_file
-    ]
-
-    proc = subprocess.Popen(
-        args,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True
-    )
-
-    jobs[job_id] = {
-        "process": proc,
-        "output_file": output_file,
-        "progress_file": progress_file,
-        "stdout": "",
-        "stderr": "",
-        "returncode": None,
-        "created_at": time.time()
-    }
-
-    t = threading.Thread(target=monitor_process, args=(job_id, proc), daemon=True)
-    t.start()
-
-    return {"job_id": job_id}        

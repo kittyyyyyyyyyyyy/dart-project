@@ -11,10 +11,6 @@
       line-height: 1.5;
     }
 
-    h1 {
-      margin-bottom: 24px;
-    }
-
     h2 {
       margin-top: 40px;
       margin-bottom: 18px;
@@ -168,6 +164,7 @@
     <div id="cgCompanySelectArea" class="field hidden">
       <label>회사명 선택</label>
       <div class="hint">검색 후 추천 목록에서 선택하고, + 버튼으로 여러 회사를 추가하세요.</div>
+      <div id="cgSuggestionStatus" class="hint"></div>
 
       <div class="row" style="margin-top: 8px;">
         <input type="text" id="cgCompanySearch" placeholder="회사명을 입력하세요">
@@ -214,6 +211,7 @@
     <div id="rmCompanySelectArea" class="field hidden">
       <label>회사명 선택</label>
       <div class="hint">검색 후 추천 목록에서 선택하고, + 버튼으로 여러 회사를 추가하세요.</div>
+      <div id="rmSuggestionStatus" class="hint"></div>
 
       <div class="row" style="margin-top: 8px;">
         <input type="text" id="rmCompanySearch" placeholder="회사명을 입력하세요">
@@ -255,11 +253,9 @@
     function setDateRanges() {
       const today = new Date().toISOString().split("T")[0];
 
-      // 기업지배구조보고서
       document.getElementById("cgStartDate").max = today;
       document.getElementById("cgEndDate").max = today;
 
-      // 정기주주총회결과
       document.getElementById("rmStartDate").min = "2026-01-01";
       document.getElementById("rmEndDate").min = "2026-01-01";
       document.getElementById("rmStartDate").max = today;
@@ -278,6 +274,7 @@
         state[prefix].selectedSuggestion = null;
         document.getElementById(`${prefix}CompanySearch`).value = "";
         document.getElementById(`${prefix}Suggestions`).style.display = "none";
+        document.getElementById(`${prefix}SuggestionStatus`).textContent = "";
         renderSelectedCompanies(prefix);
       }
     }
@@ -311,14 +308,18 @@
     async function fetchSuggestions(prefix) {
       const q = document.getElementById(`${prefix}CompanySearch`).value.trim();
       const suggestionsBox = document.getElementById(`${prefix}Suggestions`);
+      const statusBox = document.getElementById(`${prefix}SuggestionStatus`);
 
       state[prefix].selectedSuggestion = null;
       suggestionsBox.innerHTML = "";
 
       if (q.length < 1) {
         suggestionsBox.style.display = "none";
+        statusBox.textContent = "";
         return;
       }
+
+      statusBox.textContent = "회사명 검색 중...";
 
       try {
         const url = `/company-suggestions?q=${encodeURIComponent(q)}`;
@@ -327,6 +328,7 @@
 
         if (!data.companies || data.companies.length === 0) {
           suggestionsBox.style.display = "none";
+          statusBox.textContent = "일치하는 회사명이 없습니다.";
           return;
         }
 
@@ -340,19 +342,26 @@
             state[prefix].selectedSuggestion = company;
             document.getElementById(`${prefix}CompanySearch`).value = company;
             suggestionsBox.style.display = "none";
+            statusBox.textContent = `선택됨: ${company}`;
           };
           suggestionsBox.appendChild(div);
         });
 
         suggestionsBox.style.display = suggestionsBox.children.length ? "block" : "none";
+        statusBox.textContent = suggestionsBox.children.length
+          ? "추천 목록에서 회사를 선택하세요."
+          : "일치하는 회사명이 없습니다.";
+
       } catch (e) {
         suggestionsBox.style.display = "none";
+        statusBox.textContent = "회사명 추천을 불러오지 못했습니다.";
       }
     }
 
     function addSelectedCompany(prefix) {
       const input = document.getElementById(`${prefix}CompanySearch`);
       const value = input.value.trim();
+      const statusBox = document.getElementById(`${prefix}SuggestionStatus`);
 
       if (!value) {
         alert("회사명을 입력하거나 추천 목록에서 선택하세요.");
@@ -371,14 +380,24 @@
       input.value = "";
       state[prefix].selectedSuggestion = null;
       document.getElementById(`${prefix}Suggestions`).style.display = "none";
+      statusBox.textContent = "추가 완료";
       renderSelectedCompanies(prefix);
     }
 
     function attachSearchListener(prefix) {
-      document.getElementById(`${prefix}CompanySearch`).addEventListener("input", () => {
+      const input = document.getElementById(`${prefix}CompanySearch`);
+
+      input.addEventListener("input", () => {
         state[prefix].selectedSuggestion = null;
         clearTimeout(state[prefix].suggestionTimer);
         state[prefix].suggestionTimer = setTimeout(() => fetchSuggestions(prefix), 300);
+      });
+
+      input.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          addSelectedCompany(prefix);
+        }
       });
     }
 
