@@ -14,6 +14,7 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 load_dotenv()
 API_KEY = os.getenv("DART_API_KEY")
@@ -55,20 +56,6 @@ def write_progress(progress_file, status, percent, message, current=0, total=0):
         json.dump(data, f, ensure_ascii=False)
 
 
-def chunk_date_ranges(start_date_str, end_date_str, chunk_days=30):
-    start = datetime.strptime(start_date_str, "%Y-%m-%d")
-    end = datetime.strptime(end_date_str, "%Y-%m-%d")
-    ranges = []
-    current = start
-
-    while current <= end:
-        chunk_end = min(current + timedelta(days=chunk_days - 1), end)
-        ranges.append((current.strftime("%Y%m%d"), chunk_end.strftime("%Y%m%d")))
-        current = chunk_end + timedelta(days=1)
-
-    return ranges
-
-
 def normalize_agenda_no(text: str):
     if not text:
         return ""
@@ -77,183 +64,191 @@ def normalize_agenda_no(text: str):
     return m.group(1) if m else ""
 
 
-# -----------------------------
-# 국민연금 목록 수집
-# -----------------------------
-def parse_go_detail_args(raw):
-    """
-    javascript:fnc_goDetail('','0095000','00010','20260320','1');
-    -> ["", "0095000", "00010", "20260320", "1"]
-    """
-    m = re.search(r"fnc_goDetail\((.*?)\)", raw)
+def safe_text(locator):
+    try:
+        return locator.text_content() or ""
+    except Exception:
+        return ""
+
+
+# -----------------------------------
+# 국민연금: Playwright로 목록 + 상세 수집
+# -----------------------------------
+def setup_nps_search(page, start_date, end_date, company_keyword=""):
+    page.goto(
+        "https://fund.nps.or.kr/impa/edwmpblnt/getOHEF0007M0.do?menuId=MN24000636",
+        wait_until="domcontentloaded",
+        timeout=120000
+    )
+
+    page.wait_for_timeout(1500)
+
+    visible_inputs = page.locator("input:visible")
+    count = visible_inputs.count()
+
+    text_like_inputs = []
+    for i in range(count):
+        inp = visible_inputs.nth(i)
+        t = (inp.get_attribute("type") or "").lower()
+        if t in ("text", "search", "date", ""):
+            text_like_inputs.append(inp)
+
+    if len(text_like_inputs) < 3:
+        raise RuntimeError("국민연금 검색 입력창을 찾지 못했습니다.")
+
+    # 회사명, 시작일, 종료일 순으로 가정
+    company_input = text_like_inputs[0]
+    start_input = text_like_inputs[1]
+    end_input = text_like_inputs[2]
+
+    company_input.fill(company_keyword)
+    start_input.fill(start_date.replace("-", ""))
+    end_input.fill(end_date.replace("-", ""))
+
+    search_button = page.get_by_text("검색", exact=True).first
+    search_button.click()
+
+    page.wait_for_load_state("domcontentloaded")
+    page.wait_for_timeout(2000)
+
+
+def get_total_count(page):
+    body_text = page.locator("body").text_content() or ""
+    m = re.search(r"총\s*([\d,]+)\s*건", body_text)
     if not m:
-        return []
-
-    inside = m.group(1)
-    args = re.findall(r"'(.*?)'", inside)
-    return args
+        return 0
+    return int(m.group(1).replace(",", ""))
 
 
-def fetch_nps_vote_list(start_date, end_date, company_names=None, progress_file=None):
-    """
-    국민연금 목록 페이지 전체 페이지 순회
-    """
-    base_url = "https://fund.nps.or.kr/impa/edwmpblnt/getOHEF0007M0.do"
+def go_to_page(page, target_page):
+    if target_page == 1:
+        return
+
+    # 페이지 숫자 링크가 안 보이면 "다음"을 눌러 pager block 이동
+    safety = 0
+    while safety < 30:
+        safety += 1
+        page_links = page.locator("a")
+        link_count = page_links.count()
+
+        found = False
+        for i in range(link_count):
+            txt = safe_text(page_links.nth(i)).strip()
+            if txt == str(target_page):
+                page_links.nth(i).click()
+                page.wait_for_load_state("domcontentloaded")
+                page.wait_for_timeout(1200)
+                found = True
+                break
+
+        if found:
+            return
+
+        # 없으면 다음 블록으로
+        next_clicked = False
+        for i in range(link_count):
+            txt = safe_text(page_links.nth(i)).strip()
+            if txt == "다음":
+                page_links.nth(i).click()
+                page.wait_for_load_state("domcontentloaded")
+                page.wait_for_timeout(1200)
+                next_clicked = True
+                break
+
+        if not next_clicked:
+            raise RuntimeError(f"국민연금 목록 {target_page}페이지로 이동하지 못했습니다.")
+
+
+def collect_rows_on_current_page(page, company_names=None):
     company_set = set(company_names or [])
-    all_rows = []
+    items = []
 
-    date_ranges = chunk_date_ranges(start_date, end_date, chunk_days=30)
-    total_steps = len(date_ranges)
-    step = 0
+    rows = page.locator("table tbody tr")
+    row_count = rows.count()
 
-    for s_date, e_date in date_ranges:
-        step += 1
-        base_percent = min(25, 5 + int((step / max(1, total_steps)) * 20))
+    for i in range(row_count):
+        tr = rows.nth(i)
+        cols = tr.locator("td")
+        col_count = cols.count()
 
-        page_index = 1
-        while True:
-            write_progress(
-                progress_file,
-                "running",
-                base_percent,
-                f"국민연금 목록 조회 중... ({s_date}~{e_date}, page {page_index})",
-                step,
-                total_steps
-            )
+        if col_count < 5:
+            continue
 
-            params = {
-                "menuId": "MN24000636",
-                "searchFromDate": s_date,
-                "searchToDate": e_date,
-                "pageIndex": page_index
-            }
+        values = [safe_text(cols.nth(j)).strip() for j in range(col_count)]
+        if len(values) < 5:
+            continue
 
-            res = http.get(base_url, params=params, timeout=(30, 120))
-            res.raise_for_status()
+        no = values[0]
+        corp_name = values[1]
+        stock_code = values[2]
+        meeting_date = values[3]
+        category = values[4]
 
-            soup = BeautifulSoup(res.text, "lxml")
-            rows = soup.select("table tbody tr")
+        if "정기주총" not in category:
+            continue
 
-            if not rows:
-                break
+        if company_set and corp_name not in company_set:
+            continue
 
-            page_items = 0
+        # 회사명 링크
+        link = tr.locator("a").first
+        if link.count() == 0:
+            continue
 
-            for tr in rows:
-                cols = [td.get_text(" ", strip=True) for td in tr.select("td")]
-                if len(cols) < 5:
-                    continue
+        items.append({
+            "no": no,
+            "corp_name": corp_name,
+            "stock_code": stock_code,
+            "meeting_date": meeting_date,
+            "category": category,
+            "row_index": i
+        })
 
-                no = cols[0]
-                corp_name = cols[1]
-                stock_code = cols[2]
-                meeting_date = cols[3]
-                category = cols[4]
-
-                if "정기주총" not in category:
-                    continue
-
-                if company_set and corp_name not in company_set:
-                    continue
-
-                link = tr.select_one("a")
-                href = link.get("href", "") if link else ""
-                onclick = link.get("onclick", "") if link else ""
-
-                raw_js = href if href.startswith("javascript:") else onclick
-                detail_args = parse_go_detail_args(raw_js)
-
-                all_rows.append({
-                    "no": no,
-                    "corp_name": corp_name,
-                    "stock_code": stock_code,
-                    "meeting_date": meeting_date,
-                    "category": category,
-                    "detail_args": detail_args
-                })
-                page_items += 1
-
-            # 국민연금 목록은 화면상 10건 단위 페이지 구조
-            # 한 페이지에서 0건이면 종료
-            if page_items == 0:
-                break
-
-            # 다음 페이지 존재 여부: 현재 페이지 숫자 링크/다음 텍스트 기준으로 추정
-            page_text = soup.get_text(" ", strip=True)
-            if "다음" not in page_text and page_items < 10:
-                break
-
-            if page_items < 10:
-                break
-
-            page_index += 1
-            time.sleep(0.15)
-
-    # 중복 제거
-    dedup = {}
-    for row in all_rows:
-        key = (row["corp_name"], row["stock_code"], row["meeting_date"])
-        dedup[key] = row
-
-    return list(dedup.values())
+    return items
 
 
-# -----------------------------
-# 국민연금 상세 수집
-# -----------------------------
-def fetch_nps_detail_table(item):
-    """
-    detail_args 예시:
-    ["", "0095000", "00010", "20260320", "1"]
-
-    사이트 패턴상 M0(list) -> M1(detail)로 넘어가는 구조를 우선 사용.
-    """
-    args = item.get("detail_args", [])
-    if len(args) < 5:
+def parse_detail_table_from_page(page):
+    tables = page.locator("table")
+    table_count = tables.count()
+    if table_count == 0:
         return []
 
-    arg0, arg1, arg2, arg3, arg4 = args
+    best_rows = []
+    best_table = None
 
-    detail_url = "https://fund.nps.or.kr/impa/edwmpblnt/getOHEF0007M1.do"
+    for i in range(table_count):
+        tb = tables.nth(i)
+        rows = tb.locator("tr")
+        rc = rows.count()
+        if rc > len(best_rows):
+            best_rows = list(range(rc))
+            best_table = tb
 
-    # 사이트 구조상 실제 파라미터명이 다를 수 있으나,
-    # fnc_goDetail에서 넘기는 5개 값을 그대로 전달하는 방식으로 우선 구성
-    params = {
-        "menuId": "MN24000636",
-        "arg0": arg0,
-        "arg1": arg1,
-        "arg2": arg2,
-        "arg3": arg3,
-        "arg4": arg4
-    }
-
-    res = http.get(detail_url, params=params, timeout=(30, 120))
-    res.raise_for_status()
-
-    return parse_nps_detail_html(res.text)
-
-
-def parse_nps_detail_html(html_text):
-    soup = BeautifulSoup(html_text, "lxml")
-
-    tables = soup.select("table")
-    if not tables:
+    if best_table is None:
         return []
 
-    # 가장 큰 표를 상세표로 사용
-    table = max(tables, key=lambda t: len(t.select("tr")))
+    rows = best_table.locator("tr")
+    row_count = rows.count()
+    if row_count < 2:
+        return []
 
-    rows = []
-    for tr in table.select("tr"):
-        cols = [cell.get_text(" ", strip=True) for cell in tr.select("th, td")]
+    parsed_rows = []
+    for i in range(row_count):
+        tr = rows.nth(i)
+        cells = tr.locator("th, td")
+        cell_count = cells.count()
+        if cell_count == 0:
+            continue
+
+        cols = [safe_text(cells.nth(j)).strip() for j in range(cell_count)]
         if cols:
-            rows.append(cols)
+            parsed_rows.append(cols)
 
-    if not rows or len(rows) < 2:
+    if len(parsed_rows) < 2:
         return []
 
-    header = rows[0]
-    data_rows = rows[1:]
+    # 첫 줄 헤더 제거
+    data_rows = parsed_rows[1:]
 
     normalized = []
     for idx, row in enumerate(data_rows, start=1):
@@ -268,9 +263,157 @@ def parse_nps_detail_html(html_text):
     return normalized
 
 
-# -----------------------------
+def fetch_nps_vote_list_and_details(start_date, end_date, company_names=None, progress_file=None):
+    results = []
+    fail_rows = []
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"]
+        )
+        context = browser.new_context(locale="ko-KR")
+        page = context.new_page()
+
+        write_progress(progress_file, "running", 3, "국민연금 목록 검색 중...")
+
+        # 전부/선택에 따라 회사명 검색칸은 비워두고 전체 검색 후 필터링
+        setup_nps_search(page, start_date, end_date, company_keyword="")
+
+        total_count = get_total_count(page)
+        total_pages = max(1, (total_count + 9) // 10)
+
+        write_progress(
+            progress_file,
+            "running",
+            8,
+            f"국민연금 목록 {total_count}건 / {total_pages}페이지 확인",
+            0,
+            total_pages
+        )
+
+        all_items = []
+
+        for page_no in range(1, total_pages + 1):
+            write_progress(
+                progress_file,
+                "running",
+                min(25, 8 + int((page_no / total_pages) * 17)),
+                f"국민연금 목록 수집 중... ({page_no}/{total_pages}페이지)",
+                page_no,
+                total_pages
+            )
+
+            if page_no > 1:
+                go_to_page(page, page_no)
+
+            page.wait_for_timeout(700)
+            page_items = collect_rows_on_current_page(page, company_names=company_names)
+            all_items.extend(page_items)
+
+        # 중복 제거
+        dedup = {}
+        for item in all_items:
+            key = (item["corp_name"], item["stock_code"], item["meeting_date"])
+            dedup[key] = item
+        all_items = list(dedup.values())
+
+        total_items = len(all_items)
+        if total_items == 0:
+            browser.close()
+            return [], [["", "", "", "nps_list_empty"]]
+
+        # 상세 수집
+        for idx, item in enumerate(all_items, start=1):
+            corp_name = item["corp_name"]
+            stock_code = item["stock_code"]
+            meeting_date = item["meeting_date"]
+
+            percent = 25 + int((idx / total_items) * 35)
+            write_progress(
+                progress_file,
+                "running",
+                percent,
+                f"국민연금 상세 수집 중... {idx}/{total_items} {corp_name}",
+                idx,
+                total_items
+            )
+
+            try:
+                # 다시 검색 화면 진입 후 해당 페이지 이동
+                setup_nps_search(page, start_date, end_date, company_keyword="")
+
+                page.wait_for_timeout(1000)
+
+                # 현재 아이템이 어느 페이지에 있는지 다시 찾아야 하므로 전 페이지를 탐색
+                found = False
+                for page_no in range(1, total_pages + 1):
+                    if page_no > 1:
+                        go_to_page(page, page_no)
+                    page.wait_for_timeout(500)
+
+                    rows = page.locator("table tbody tr")
+                    row_count = rows.count()
+
+                    for r in range(row_count):
+                        tr = rows.nth(r)
+                        cols = tr.locator("td")
+                        if cols.count() < 5:
+                            continue
+
+                        vals = [safe_text(cols.nth(j)).strip() for j in range(cols.count())]
+                        if len(vals) < 5:
+                            continue
+
+                        cur_name = vals[1]
+                        cur_code = vals[2]
+                        cur_date = vals[3]
+                        cur_cat = vals[4]
+
+                        if (
+                            cur_name == corp_name and
+                            cur_code == stock_code and
+                            cur_date == meeting_date and
+                            "정기주총" in cur_cat
+                        ):
+                            link = tr.locator("a").first
+                            link.click()
+                            page.wait_for_load_state("domcontentloaded")
+                            page.wait_for_timeout(1200)
+
+                            detail_rows = parse_detail_table_from_page(page)
+                            if not detail_rows:
+                                fail_rows.append([corp_name, stock_code, meeting_date, "nps_detail_not_found"])
+                            else:
+                                for row in detail_rows:
+                                    row["corp_name"] = corp_name
+                                    row["stock_code"] = stock_code
+                                    row["meeting_date"] = meeting_date
+                                    row["nps_category"] = cur_cat
+                                    results.append(row)
+
+                            found = True
+                            break
+
+                    if found:
+                        break
+
+                if not found:
+                    fail_rows.append([corp_name, stock_code, meeting_date, "nps_row_not_found_again"])
+
+            except PlaywrightTimeoutError:
+                fail_rows.append([corp_name, stock_code, meeting_date, "nps_detail_timeout"])
+            except Exception as e:
+                fail_rows.append([corp_name, stock_code, meeting_date, f"nps_error: {str(e)}"])
+
+        browser.close()
+
+    return results, fail_rows
+
+
+# -----------------------------------
 # DART 주주총회소집공고 수집
-# -----------------------------
+# -----------------------------------
 def fetch_dart_meeting_notice(corp_name, meeting_date):
     url = "https://opendart.fss.or.kr/api/list.json"
 
@@ -405,27 +548,6 @@ def extract_dart_agendas(file_path):
     return result
 
 
-def match_nps_with_dart(nps_rows, dart_agendas):
-    dart_map = {}
-    for item in dart_agendas:
-        key = item.get("dart_agenda_no_norm", "")
-        if key and key not in dart_map:
-            dart_map[key] = item
-
-    merged = []
-    for row in nps_rows:
-        agenda_no = row.get("agenda_no_norm", "")
-        dart_item = dart_map.get(agenda_no)
-
-        out = dict(row)
-        out["dart_agenda_no_norm"] = dart_item.get("dart_agenda_no_norm", "") if dart_item else ""
-        out["dart_agenda_text"] = dart_item.get("dart_agenda_text", "") if dart_item else ""
-        out["match_status"] = "matched" if dart_item else "unmatched"
-        merged.append(out)
-
-    return merged
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--start-date", required=True)
@@ -447,87 +569,90 @@ def main():
     except Exception:
         company_names = []
 
-    write_progress(progress_file, "running", 2, "국민연금 목록 조회 시작")
+    write_progress(progress_file, "running", 2, "국민연금 목록/상세 수집 시작")
 
-    nps_list = fetch_nps_vote_list(start_date, end_date, company_names, progress_file=progress_file)
+    nps_rows, fail_rows = fetch_nps_vote_list_and_details(
+        start_date, end_date, company_names, progress_file=progress_file
+    )
 
-    total = len(nps_list)
-    write_progress(progress_file, "running", 20, f"국민연금 대상 {total}건 조회 완료", 0, total)
-
-    all_rows = []
-    fail_rows = []
-
-    if total == 0:
+    if not nps_rows:
         with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
             pd.DataFrame().to_excel(writer, sheet_name="data", index=False)
-            pd.DataFrame(columns=["corp_name", "stock_code", "meeting_date", "reason"]).to_excel(
+            pd.DataFrame(fail_rows, columns=["corp_name", "stock_code", "meeting_date", "reason"]).to_excel(
                 writer, sheet_name="fail", index=False
             )
         write_progress(progress_file, "done", 100, "완료", 0, 0)
         return
 
-    for idx, item in enumerate(nps_list, start=1):
-        corp_name = item["corp_name"]
-        stock_code = item["stock_code"]
-        meeting_date = item["meeting_date"]
+    # 회사/주총일 단위로 묶어서 DART 매칭
+    grouped = {}
+    for row in nps_rows:
+        key = (row["corp_name"], row["stock_code"], row["meeting_date"])
+        grouped.setdefault(key, []).append(row)
 
-        percent = 20 + int((idx / total) * 70)
+    total_groups = len(grouped)
+    merged_rows = []
+    group_idx = 0
+
+    for (corp_name, stock_code, meeting_date), rows in grouped.items():
+        group_idx += 1
+        percent = 65 + int((group_idx / total_groups) * 30)
         write_progress(
             progress_file,
             "running",
             percent,
-            f"{idx}/{total} 처리 중: {corp_name}",
-            idx,
-            total
+            f"DART 의안 매칭 중... {group_idx}/{total_groups} {corp_name}",
+            group_idx,
+            total_groups
         )
 
-        try:
-            nps_detail_rows = fetch_nps_detail_table(item)
-            if not nps_detail_rows:
-                fail_rows.append([corp_name, stock_code, meeting_date, "nps_detail_not_found"])
-                continue
+        notices = fetch_dart_meeting_notice(corp_name, meeting_date)
+        dart_agendas = []
+        dart_rcept_no = ""
+        dart_report_nm = ""
 
-            notices = fetch_dart_meeting_notice(corp_name, meeting_date)
-            dart_agendas = []
-            dart_rcept_no = ""
-            dart_report_nm = ""
+        if notices:
+            notice = notices[0]
+            dart_rcept_no = notice.get("rcept_no", "")
+            dart_report_nm = notice.get("report_nm", "")
 
-            if notices:
-                notice = notices[0]
-                dart_rcept_no = notice.get("rcept_no", "")
-                dart_report_nm = notice.get("report_nm", "")
+            folder = download_dart_document(dart_rcept_no)
+            if folder:
+                main_file = find_main_file(folder)
+                if main_file:
+                    dart_agendas = extract_dart_agendas(main_file)
+                shutil.rmtree(folder, ignore_errors=True)
 
-                folder = download_dart_document(dart_rcept_no)
-                if folder:
-                    main_file = find_main_file(folder)
-                    if main_file:
-                        dart_agendas = extract_dart_agendas(main_file)
-                    shutil.rmtree(folder, ignore_errors=True)
+        dart_map = {}
+        for item in dart_agendas:
+            key = item.get("dart_agenda_no_norm", "")
+            if key and key not in dart_map:
+                dart_map[key] = item
 
-            merged_rows = match_nps_with_dart(nps_detail_rows, dart_agendas)
+        for row in rows:
+            agenda_no = row.get("agenda_no_norm", "")
+            dart_item = dart_map.get(agenda_no)
 
-            for row in merged_rows:
-                row["corp_name"] = corp_name
-                row["stock_code"] = stock_code
-                row["meeting_date"] = meeting_date
-                row["nps_category"] = item["category"]
-                row["dart_rcept_no"] = dart_rcept_no
-                row["dart_report_nm"] = dart_report_nm
-                all_rows.append(row)
+            out = dict(row)
+            out["dart_rcept_no"] = dart_rcept_no
+            out["dart_report_nm"] = dart_report_nm
+            out["dart_agenda_no_norm"] = dart_item.get("dart_agenda_no_norm", "") if dart_item else ""
+            out["dart_agenda_text"] = dart_item.get("dart_agenda_text", "") if dart_item else ""
+            out["match_status"] = "matched" if dart_item else "unmatched"
 
-        except Exception as e:
-            fail_rows.append([corp_name, stock_code, meeting_date, f"error: {str(e)}"])
+            merged_rows.append(out)
 
-        time.sleep(0.12)
+        if not notices:
+            fail_rows.append([corp_name, stock_code, meeting_date, "dart_notice_not_found"])
 
-    result_df = pd.DataFrame(all_rows)
+    result_df = pd.DataFrame(merged_rows)
     fail_df = pd.DataFrame(fail_rows, columns=["corp_name", "stock_code", "meeting_date", "reason"])
 
     with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
         result_df.to_excel(writer, sheet_name="data", index=False)
         fail_df.to_excel(writer, sheet_name="fail", index=False)
 
-    write_progress(progress_file, "done", 100, "엑셀 생성 완료", total, total)
+    write_progress(progress_file, "done", 100, "엑셀 생성 완료", total_groups, total_groups)
 
 
 if __name__ == "__main__":
