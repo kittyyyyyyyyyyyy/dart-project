@@ -387,7 +387,7 @@ def download_file(job_id: str):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-    @app.post("/start-nps-download")
+@app.post("/start-nps-download")
 def start_nps_download(payload: DownloadRequest):
     job_id = str(uuid.uuid4())[:8]
     output_file = f"nps_vote_result_{job_id}.xlsx"
@@ -424,3 +424,11 @@ def start_nps_download(payload: DownloadRequest):
     t.start()
 
     return {"job_id": job_id}
+
+@app.get("/nps-test")
+def nps_test():
+    return {"ok": True, "message": "nps route alive"}
+
+@app.post("/start-nps-download-test")
+def start_nps_download_test():
+    return {"job_id": "test1234"}
