@@ -24,10 +24,10 @@ if not API_KEY:
 def make_session():
     session = requests.Session()
     retry = Retry(
-        total=5,
-        connect=5,
-        read=5,
-        backoff_factor=1.5,
+        total=6,
+        connect=6,
+        read=6,
+        backoff_factor=2,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET"]
     )
@@ -56,7 +56,7 @@ def write_progress(progress_file, status, percent, message, current=0, total=0):
         json.dump(data, f, ensure_ascii=False)
 
 
-def chunk_date_ranges(start_date_str, end_date_str, chunk_days=90):
+def chunk_date_ranges(start_date_str, end_date_str, chunk_days=30):
     start = datetime.strptime(start_date_str, "%Y-%m-%d")
     end = datetime.strptime(end_date_str, "%Y-%m-%d")
 
@@ -76,8 +76,20 @@ def chunk_date_ranges(start_date_str, end_date_str, chunk_days=90):
     return ranges
 
 
-def safe_get(url, params):
-    return http.get(url, params=params, timeout=(20, 120))
+def safe_get(url, params, max_attempts=4):
+    last_error = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            # connect timeout을 20 -> 60으로 증가
+            # read timeout도 120 -> 180으로 증가
+            return http.get(url, params=params, timeout=(60, 180))
+        except requests.exceptions.RequestException as e:
+            last_error = e
+            if attempt < max_attempts:
+                time.sleep(attempt * 2)
+            else:
+                raise last_error
 
 
 def fetch_latest_reports(start_date, end_date, company_names=None, progress_file=None):
@@ -87,7 +99,8 @@ def fetch_latest_reports(start_date, end_date, company_names=None, progress_file
     markets = ["Y", "K"]
     company_names_set = set(company_names or [])
 
-    ranges = chunk_date_ranges(start_date, end_date)
+    # 90일 -> 30일로 줄여서 timeout 완화
+    ranges = chunk_date_ranges(start_date, end_date, chunk_days=30)
     total_steps = max(1, len(ranges) * len(markets))
     step = 0
 
@@ -113,13 +126,26 @@ def fetch_latest_reports(start_date, end_date, company_names=None, progress_file
                     "end_de": end_de,
                     "corp_cls": corp_cls,
                     "page_no": page_no,
-                    "page_count": 100,
+                    # 100 -> 50으로 줄여서 부담 완화
+                    "page_count": 50,
                     "sort": "date",
                     "sort_mth": "desc"
                 }
 
-                res = safe_get(url, params)
-                data = res.json()
+                try:
+                    res = safe_get(url, params)
+                    data = res.json()
+                except requests.exceptions.RequestException as e:
+                    write_progress(
+                        progress_file,
+                        "running",
+                        approx_percent,
+                        f"일시적 연결 지연, 재시도 후 구간 건너뜀: {bgn_de}~{end_de}, 시장 {corp_cls}",
+                        step,
+                        total_steps
+                    )
+                    # 이 구간/시장만 건너뛰고 다음으로 진행
+                    break
 
                 status = data.get("status")
                 if status != "000":
@@ -150,11 +176,11 @@ def fetch_latest_reports(start_date, end_date, company_names=None, progress_file
                     total_steps
                 )
 
-                if len(items) < 100:
+                if len(items) < 50:
                     break
 
                 page_no += 1
-                time.sleep(0.12)
+                time.sleep(0.2)
 
     dedup = {}
     for item in all_results:
