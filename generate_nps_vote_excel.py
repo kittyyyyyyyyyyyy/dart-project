@@ -18,6 +18,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 
 load_dotenv()
 API_KEY = os.getenv("DART_API_KEY")
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = os.getenv("PLAYWRIGHT_BROWSERS_PATH", "/app/pw-browsers")
 
 if not API_KEY:
     raise ValueError("DART_API_KEY가 없습니다. 환경 변수를 확인하세요.")
