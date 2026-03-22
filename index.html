@@ -539,9 +539,9 @@
         const data = await res.json();
 
         if (!data.job_id) {
-          errorBox.textContent = "작업 시작 실패";
-          return;
-        }
+  errorBox.textContent = "작업 시작 실패\n\n응답:\n" + JSON.stringify(data, null, 2);
+  return;
+}
 
         const jobId = data.job_id;
 
