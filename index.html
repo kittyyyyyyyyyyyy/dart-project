@@ -234,58 +234,10 @@
     <div class="error-box" id="rmErrorBox"></div>
   </div>
 
-  <div class="section">
-    <h2>국민연금 의결권행사</h2>
-
-    <div class="field">
-      <label>시작일</label><br>
-      <input type="date" id="npsStartDate">
-    </div>
-
-    <div class="field">
-      <label>종료일</label><br>
-      <input type="date" id="npsEndDate">
-    </div>
-
-    <div class="field">
-      <label>회사 선택 방식</label><br>
-      <select id="npsCompanyMode" onchange="toggleCompanyMode('nps')">
-        <option value="all" selected>전부</option>
-        <option value="select">선택</option>
-      </select>
-    </div>
-
-    <div id="npsCompanySelectArea" class="field hidden">
-      <label>회사명 선택</label>
-      <div class="hint">검색 후 추천 목록에서 선택하고, + 버튼으로 여러 회사를 추가하세요.</div>
-      <div id="npsSuggestionStatus" class="hint"></div>
-
-      <div class="row" style="margin-top: 8px;">
-        <input type="text" id="npsCompanySearch" placeholder="회사명을 입력하세요">
-        <button type="button" onclick="addSelectedCompany('nps')">+</button>
-      </div>
-
-      <div id="npsSuggestions" class="suggestions"></div>
-      <div id="npsSelectedCompanies" class="chips"></div>
-    </div>
-
-    <button onclick="startDownload('nps')">엑셀 다운로드</button>
-
-    <div class="progress-wrap" id="npsProgressWrap">
-      <div class="progress-bar-bg">
-        <div class="progress-bar-fill" id="npsProgressFill"></div>
-      </div>
-      <div class="progress-text" id="npsProgressText">대기 중...</div>
-    </div>
-
-    <div class="error-box" id="npsErrorBox"></div>
-  </div>
-
   <script>
     const state = {
       cg: { selectedCompanies: [], selectedSuggestion: null, pollTimer: null, suggestionTimer: null },
-      rm: { selectedCompanies: [], selectedSuggestion: null, pollTimer: null, suggestionTimer: null },
-      nps: { selectedCompanies: [], selectedSuggestion: null, pollTimer: null, suggestionTimer: null }
+      rm: { selectedCompanies: [], selectedSuggestion: null, pollTimer: null, suggestionTimer: null }
     };
 
     function setDateRanges() {
@@ -298,10 +250,6 @@
       document.getElementById("rmEndDate").min = "2026-01-01";
       document.getElementById("rmStartDate").max = today;
       document.getElementById("rmEndDate").max = today;
-
-      // 국민연금은 미래 종료일 허용: max 설정하지 않음
-      // document.getElementById("npsStartDate").max = today;
-      // document.getElementById("npsEndDate").max = today;
     }
 
     function toggleCompanyMode(prefix) {
@@ -489,7 +437,6 @@
 
       let apiUrl = "/start-download";
       if (prefix === "rm") apiUrl = "/start-regular-download";
-      if (prefix === "nps") apiUrl = "/start-nps-download";
 
       try {
         const res = await fetch(apiUrl, {
@@ -565,7 +512,6 @@
       setDateRanges();
       attachSearchListener("cg");
       attachSearchListener("rm");
-      attachSearchListener("nps");
     }
 
     init();
