@@ -57,21 +57,29 @@ def chunk_date_ranges(start_date_str, end_date_str, chunk_days=90):
 
 
 def fetch_latest_reports(start_date, end_date, company_names=None, progress_file=None):
-    """
-    OpenDART에서 최신 공시 목록을 직접 조회
-    """
     url = "https://opendart.fss.or.kr/api/list.json"
     all_results = []
 
     markets = ["Y", "K"]
     company_names_set = set(company_names or [])
 
-    write_progress(progress_file, "running", 5, "최신 공시 목록 조회 중...")
-
     ranges = chunk_date_ranges(start_date, end_date)
+    total_steps = max(1, len(ranges) * len(markets))
+    step = 0
 
     for bgn_de, end_de in ranges:
         for corp_cls in markets:
+            step += 1
+            approx_percent = min(40, 5 + int((step / total_steps) * 35))
+            write_progress(
+                progress_file,
+                "running",
+                approx_percent,
+                f"공시 검색 중... ({bgn_de}~{end_de}, 시장 {corp_cls})",
+                step,
+                total_steps
+            )
+
             page_no = 1
 
             while True:
@@ -204,59 +212,56 @@ def select_target_group_rows(table_rows):
     if not table_rows or len(table_rows) < 2:
         return []
 
-    data_rows = table_rows[1:]  # 헤더 제거
+    data_rows = table_rows[1:]
     if not data_rows:
         return []
 
-    # col_1 값 기준으로 연속 그룹 나누기
     groups = []
     current_key = None
     current_rows = []
 
     for row in data_rows:
-        if not row:
-            continue
+      if not row:
+        continue
 
-        key = row[0].strip() if len(row) > 0 else ""
+      key = row[0].strip() if len(row) > 0 else ""
 
-        if current_key is None:
-            current_key = key
-            current_rows = [row]
-        elif key == current_key:
-            current_rows.append(row)
-        else:
-            groups.append((current_key, current_rows))
-            current_key = key
-            current_rows = [row]
+      if current_key is None:
+        current_key = key
+        current_rows = [row]
+      elif key == current_key:
+        current_rows.append(row)
+      else:
+        groups.append((current_key, current_rows))
+        current_key = key
+        current_rows = [row]
 
     if current_rows:
-        groups.append((current_key, current_rows))
+      groups.append((current_key, current_rows))
 
     candidates = []
 
     for key, rows in groups:
-        if "정기" not in key:
-            continue
+      if "정기" not in key:
+        continue
 
-        m = re.search(r"(\d+)\s*기", key)
-        period_num = int(m.group(1)) if m else -1
+      m = re.search(r"(\d+)\s*기", key)
+      period_num = int(m.group(1)) if m else -1
 
-        candidates.append({
-            "key": key,
-            "rows": rows,
-            "period_num": period_num
-        })
+      candidates.append({
+        "key": key,
+        "rows": rows,
+        "period_num": period_num
+      })
 
     if not candidates:
-        return []
+      return []
 
-    # 숫자가 있는 후보가 있으면 가장 큰 숫자 선택
     numeric_candidates = [c for c in candidates if c["period_num"] >= 0]
     if numeric_candidates:
-        best = max(numeric_candidates, key=lambda x: x["period_num"])
-        return best["rows"]
+      best = max(numeric_candidates, key=lambda x: x["period_num"])
+      return best["rows"]
 
-    # 숫자가 없으면 그냥 첫 번째 정기 후보
     return candidates[0]["rows"]
 
 
@@ -287,7 +292,7 @@ def main():
     reports = fetch_latest_reports(start_date, end_date, company_names, progress_file=progress_file)
 
     total_reports = len(reports)
-    write_progress(progress_file, "running", 10, f"공시 {total_reports}건 조회 완료", 0, total_reports)
+    write_progress(progress_file, "running", 45, f"공시 {total_reports}건 조회 완료", 0, total_reports)
 
     all_rows = []
     fail_list = []
@@ -310,7 +315,7 @@ def main():
         report_nm = str(row.get("report_nm", ""))
         rcept_dt = str(row.get("rcept_dt", ""))
 
-        percent = 10 + int((seq / total_reports) * 85)
+        percent = 45 + int((seq / total_reports) * 50)
         write_progress(
             progress_file,
             "running",
@@ -367,7 +372,7 @@ def main():
         finally:
             shutil.rmtree(folder_name, ignore_errors=True)
 
-        time.sleep(0.15)
+        time.sleep(0.1)
 
     result_df = pd.DataFrame(all_rows)
     fail_df = pd.DataFrame(fail_list, columns=["corp_name", "stock_code", "rcept_no", "reason"])
