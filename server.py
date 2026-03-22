@@ -439,3 +439,24 @@ def nps_test():
 @app.post("/start-nps-download-test")
 def start_nps_download_test():
     return {"job_id": "test1234"}
+
+import hashlib
+
+@app.get("/debug-version")
+def debug_version():
+    def file_info(path):
+        if not os.path.exists(path):
+            return {"exists": False, "md5": None, "size": None}
+        with open(path, "rb") as f:
+            data = f.read()
+        return {
+            "exists": True,
+            "md5": hashlib.md5(data).hexdigest(),
+            "size": len(data)
+        }
+
+    return {
+        "server.py": file_info("server.py"),
+        "index.html": file_info("index.html"),
+        "generate_nps_vote_excel.py": file_info("generate_nps_vote_excel.py")
+    }    
