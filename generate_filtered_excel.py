@@ -9,6 +9,8 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 import argparse
 from datetime import datetime, timedelta
+import json
+import re
 
 load_dotenv()
 
@@ -16,6 +18,22 @@ API_KEY = os.getenv("DART_API_KEY")
 
 if not API_KEY:
     raise ValueError("DART_API_KEY가 없습니다. .env 또는 환경 변수를 확인하세요.")
+
+
+def write_progress(progress_file, status, percent, message, current=0, total=0):
+    if not progress_file:
+        return
+
+    data = {
+        "status": status,
+        "percent": percent,
+        "message": message,
+        "current": current,
+        "total": total
+    }
+
+    with open(progress_file, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
 
 
 def chunk_date_ranges(start_date_str, end_date_str, chunk_days=90):
@@ -38,17 +56,21 @@ def chunk_date_ranges(start_date_str, end_date_str, chunk_days=90):
     return ranges
 
 
-def fetch_latest_reports(start_date, end_date, company_keyword=""):
+def fetch_latest_reports(start_date, end_date, company_names=None, progress_file=None):
     """
     OpenDART에서 최신 공시 목록을 직접 조회
     """
     url = "https://opendart.fss.or.kr/api/list.json"
     all_results = []
 
-    # 코스피(Y), 코스닥(K) 둘 다 조회
     markets = ["Y", "K"]
+    company_names_set = set(company_names or [])
 
-    for bgn_de, end_de in chunk_date_ranges(start_date, end_date):
+    write_progress(progress_file, "running", 5, "최신 공시 목록 조회 중...")
+
+    ranges = chunk_date_ranges(start_date, end_date)
+
+    for bgn_de, end_de in ranges:
         for corp_cls in markets:
             page_no = 1
 
@@ -79,12 +101,10 @@ def fetch_latest_reports(start_date, end_date, company_keyword=""):
                     report_nm = str(item.get("report_nm", ""))
                     corp_name = str(item.get("corp_name", ""))
 
-                    # 기업지배구조보고서만 대상으로
                     if "기업지배구조보고서" not in report_nm:
                         continue
 
-                    # 회사명 필터가 있으면 적용
-                    if company_keyword and company_keyword.lower() not in corp_name.lower():
+                    if company_names_set and corp_name not in company_names_set:
                         continue
 
                     all_results.append(item)
@@ -93,9 +113,8 @@ def fetch_latest_reports(start_date, end_date, company_keyword=""):
                     break
 
                 page_no += 1
-                time.sleep(0.2)
+                time.sleep(0.15)
 
-    # 중복 접수번호 제거
     dedup = {}
     for item in all_results:
         dedup[item["rcept_no"]] = item
@@ -176,26 +195,113 @@ def extract_table_rows(file_path):
     return found_rows
 
 
+def select_target_group_rows(table_rows):
+    """
+    새 기준:
+    1) col_1에 반드시 '정기' 포함
+    2) '25기', '26기'처럼 숫자가 다르면 더 큰 숫자 그룹만 선택
+    """
+    if not table_rows or len(table_rows) < 2:
+        return []
+
+    data_rows = table_rows[1:]  # 헤더 제거
+    if not data_rows:
+        return []
+
+    # col_1 값 기준으로 연속 그룹 나누기
+    groups = []
+    current_key = None
+    current_rows = []
+
+    for row in data_rows:
+        if not row:
+            continue
+
+        key = row[0].strip() if len(row) > 0 else ""
+
+        if current_key is None:
+            current_key = key
+            current_rows = [row]
+        elif key == current_key:
+            current_rows.append(row)
+        else:
+            groups.append((current_key, current_rows))
+            current_key = key
+            current_rows = [row]
+
+    if current_rows:
+        groups.append((current_key, current_rows))
+
+    candidates = []
+
+    for key, rows in groups:
+        if "정기" not in key:
+            continue
+
+        m = re.search(r"(\d+)\s*기", key)
+        period_num = int(m.group(1)) if m else -1
+
+        candidates.append({
+            "key": key,
+            "rows": rows,
+            "period_num": period_num
+        })
+
+    if not candidates:
+        return []
+
+    # 숫자가 있는 후보가 있으면 가장 큰 숫자 선택
+    numeric_candidates = [c for c in candidates if c["period_num"] >= 0]
+    if numeric_candidates:
+        best = max(numeric_candidates, key=lambda x: x["period_num"])
+        return best["rows"]
+
+    # 숫자가 없으면 그냥 첫 번째 정기 후보
+    return candidates[0]["rows"]
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--start-date", required=True)   # YYYY-MM-DD
-    parser.add_argument("--end-date", required=True)     # YYYY-MM-DD
-    parser.add_argument("--company", default="")
+    parser.add_argument("--start-date", required=True)
+    parser.add_argument("--end-date", required=True)
+    parser.add_argument("--companies-json", default="[]")
     parser.add_argument("--output", required=True)
+    parser.add_argument("--progress-file", default="")
 
     args = parser.parse_args()
 
     start_date = args.start_date
     end_date = args.end_date
-    company_keyword = args.company.strip()
     output_file = args.output
+    progress_file = args.progress_file
 
-    print("최신 OpenDART 목록 조회 시작")
-    reports = fetch_latest_reports(start_date, end_date, company_keyword)
-    print("조회된 공시 수:", len(reports))
+    try:
+        company_names = json.loads(args.companies_json)
+        if not isinstance(company_names, list):
+            company_names = []
+    except Exception:
+        company_names = []
+
+    write_progress(progress_file, "running", 1, "작업 시작 중...")
+
+    reports = fetch_latest_reports(start_date, end_date, company_names, progress_file=progress_file)
+
+    total_reports = len(reports)
+    write_progress(progress_file, "running", 10, f"공시 {total_reports}건 조회 완료", 0, total_reports)
 
     all_rows = []
     fail_list = []
+
+    if total_reports == 0:
+        result_df = pd.DataFrame(all_rows)
+        fail_df = pd.DataFrame(fail_list, columns=["corp_name", "stock_code", "rcept_no", "reason"])
+
+        with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
+            result_df.to_excel(writer, sheet_name="data", index=False)
+            fail_df.to_excel(writer, sheet_name="fail", index=False)
+
+        write_progress(progress_file, "done", 100, "완료", 0, 0)
+        return
 
     for seq, row in enumerate(reports, start=1):
         corp_name = str(row.get("corp_name", ""))
@@ -204,8 +310,15 @@ def main():
         report_nm = str(row.get("report_nm", ""))
         rcept_dt = str(row.get("rcept_dt", ""))
 
-        print("=" * 60)
-        print(f"{seq}번째 처리 중: {corp_name} / {rcept_no}")
+        percent = 10 + int((seq / total_reports) * 85)
+        write_progress(
+            progress_file,
+            "running",
+            percent,
+            f"{seq}/{total_reports} 처리 중: {corp_name}",
+            seq,
+            total_reports
+        )
 
         folder_name = download_report(rcept_no)
         if not folder_name:
@@ -215,6 +328,7 @@ def main():
         main_file = find_main_file(folder_name)
         if not main_file:
             fail_list.append([corp_name, stock_code, rcept_no, "main_file_not_found"])
+            shutil.rmtree(folder_name, ignore_errors=True)
             continue
 
         try:
@@ -222,26 +336,17 @@ def main():
 
             if not table_rows:
                 fail_list.append([corp_name, stock_code, rcept_no, "table_not_found"])
+                shutil.rmtree(folder_name, ignore_errors=True)
                 continue
 
-            # 헤더 제거
-            data_rows = table_rows[1:]
-            if not data_rows:
-                fail_list.append([corp_name, stock_code, rcept_no, "no_data_after_header"])
+            selected_rows = select_target_group_rows(table_rows)
+
+            if not selected_rows:
+                fail_list.append([corp_name, stock_code, rcept_no, "target_group_not_found"])
+                shutil.rmtree(folder_name, ignore_errors=True)
                 continue
 
-            # col_1 값이 바뀌기 전까지만 저장
-            first_value = data_rows[0][0].strip()
-
-            saved_count = 0
-            for line_no, cols in enumerate(data_rows, start=1):
-                if not cols:
-                    continue
-
-                current_value = cols[0].strip()
-                if current_value != first_value:
-                    break
-
+            for line_no, cols in enumerate(selected_rows, start=1):
                 row_dict = {
                     "corp_name": corp_name,
                     "stock_code": stock_code,
@@ -255,15 +360,14 @@ def main():
                     row_dict[f"col_{i}"] = value
 
                 all_rows.append(row_dict)
-                saved_count += 1
-
-            if saved_count == 0:
-                fail_list.append([corp_name, stock_code, rcept_no, "no_rows_saved"])
 
         except Exception as e:
             fail_list.append([corp_name, stock_code, rcept_no, f"extract_error: {str(e)}"])
 
-        time.sleep(0.2)
+        finally:
+            shutil.rmtree(folder_name, ignore_errors=True)
+
+        time.sleep(0.15)
 
     result_df = pd.DataFrame(all_rows)
     fail_df = pd.DataFrame(fail_list, columns=["corp_name", "stock_code", "rcept_no", "reason"])
@@ -272,7 +376,7 @@ def main():
         result_df.to_excel(writer, sheet_name="data", index=False)
         fail_df.to_excel(writer, sheet_name="fail", index=False)
 
-    print("완료:", output_file)
+    write_progress(progress_file, "done", 100, "엑셀 생성 완료", total_reports, total_reports)
 
 
 if __name__ == "__main__":

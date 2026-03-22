@@ -2,47 +2,311 @@
 <html>
 <head>
   <meta charset="UTF-8">
-  <title>DART 데이터 다운로드</title>
+  <title>~2025 기업지배구조보고서 다운로드</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 800px;
+      margin: 40px auto;
+      line-height: 1.5;
+    }
+
+    h1 {
+      margin-bottom: 4px;
+    }
+
+    .subtitle {
+      font-size: 14px;
+      color: #666;
+      margin-bottom: 24px;
+    }
+
+    .field {
+      margin-bottom: 16px;
+    }
+
+    input[type="date"], input[type="text"] {
+      padding: 8px;
+      width: 280px;
+    }
+
+    button {
+      padding: 10px 16px;
+      cursor: pointer;
+    }
+
+    .suggestions {
+      border: 1px solid #ccc;
+      width: 300px;
+      max-height: 180px;
+      overflow-y: auto;
+      margin-top: 4px;
+      display: none;
+      background: white;
+    }
+
+    .suggestion-item {
+      padding: 8px;
+      cursor: pointer;
+      border-bottom: 1px solid #eee;
+    }
+
+    .suggestion-item:hover {
+      background: #f5f5f5;
+    }
+
+    .chips {
+      margin-top: 8px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .chip {
+      background: #eef3ff;
+      border: 1px solid #b7c8ff;
+      padding: 6px 10px;
+      border-radius: 16px;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .chip button {
+      border: none;
+      background: transparent;
+      color: #333;
+      font-weight: bold;
+      cursor: pointer;
+      padding: 0;
+    }
+
+    .progress-wrap {
+      margin-top: 24px;
+      display: none;
+    }
+
+    .progress-bar-bg {
+      width: 100%;
+      height: 24px;
+      background: #eee;
+      border-radius: 12px;
+      overflow: hidden;
+    }
+
+    .progress-bar-fill {
+      height: 100%;
+      width: 0%;
+      background: #4a78ff;
+      transition: width 0.4s ease;
+    }
+
+    .progress-text {
+      margin-top: 8px;
+      font-size: 14px;
+    }
+
+    .error-box {
+      margin-top: 16px;
+      color: #b00020;
+      white-space: pre-wrap;
+    }
+
+    .hint {
+      font-size: 13px;
+      color: #666;
+      margin-top: 6px;
+    }
+  </style>
 </head>
 <body>
-  <h1>기업지배구조보고서 다운로드</h1>
+  <h1>~2025 기업지배구조보고서 다운로드</h1>
+  <div class="subtitle">~2025 정기주주총회 결과(찬반률)</div>
 
-  <div>
-    <label>시작일:</label>
+  <div class="field">
+    <label>시작일</label><br>
     <input type="date" id="startDate">
   </div>
 
-  <br>
-
-  <div>
-    <label>종료일:</label>
+  <div class="field">
+    <label>종료일</label><br>
     <input type="date" id="endDate">
   </div>
 
-  <br>
-
-  <div>
-    <label>회사명 (선택):</label>
-    <input type="text" id="company" placeholder="예: 삼성전자">
+  <div class="field">
+    <label>회사명 선택 (여러 개 가능)</label><br>
+    <input type="text" id="companySearch" placeholder="회사명을 입력하세요">
+    <div class="hint">날짜를 먼저 선택한 뒤, DART에 실제 존재하는 회사명만 선택할 수 있습니다.</div>
+    <div id="suggestions" class="suggestions"></div>
+    <div id="selectedCompanies" class="chips"></div>
   </div>
 
-  <br>
+  <button id="downloadBtn" onclick="startDownload()">엑셀 다운로드</button>
 
-  <button onclick="downloadExcel()">엑셀 다운로드</button>
+  <div class="progress-wrap" id="progressWrap">
+    <div class="progress-bar-bg">
+      <div class="progress-bar-fill" id="progressFill"></div>
+    </div>
+    <div class="progress-text" id="progressText">대기 중...</div>
+  </div>
+
+  <div class="error-box" id="errorBox"></div>
 
   <script>
-    function downloadExcel() {
+    let selectedCompanies = [];
+    let pollTimer = null;
+    let suggestionTimer = null;
+
+    function renderSelectedCompanies() {
+      const container = document.getElementById("selectedCompanies");
+      container.innerHTML = "";
+
+      selectedCompanies.forEach((company) => {
+        const chip = document.createElement("div");
+        chip.className = "chip";
+        chip.innerHTML = `
+          <span>${company}</span>
+          <button onclick="removeCompany('${company.replace(/'/g, "\\'")}')">×</button>
+        `;
+        container.appendChild(chip);
+      });
+    }
+
+    function removeCompany(company) {
+      selectedCompanies = selectedCompanies.filter(c => c !== company);
+      renderSelectedCompanies();
+    }
+
+    async function fetchSuggestions() {
       const startDate = document.getElementById("startDate").value;
       const endDate = document.getElementById("endDate").value;
-      const company = document.getElementById("company").value;
+      const q = document.getElementById("companySearch").value.trim();
+      const suggestionsBox = document.getElementById("suggestions");
+
+      if (!startDate || !endDate) {
+        suggestionsBox.style.display = "none";
+        return;
+      }
+
+      if (q.length < 1) {
+        suggestionsBox.style.display = "none";
+        return;
+      }
+
+      try {
+        const url = `/company-suggestions?start_date=${encodeURIComponent(startDate)}&end_date=${encodeURIComponent(endDate)}&q=${encodeURIComponent(q)}`;
+        const res = await fetch(url);
+        const data = await res.json();
+
+        suggestionsBox.innerHTML = "";
+
+        if (!data.companies || data.companies.length === 0) {
+          suggestionsBox.style.display = "none";
+          return;
+        }
+
+        data.companies.forEach((company) => {
+          if (selectedCompanies.includes(company)) return;
+
+          const div = document.createElement("div");
+          div.className = "suggestion-item";
+          div.textContent = company;
+          div.onclick = () => {
+            selectedCompanies.push(company);
+            renderSelectedCompanies();
+            document.getElementById("companySearch").value = "";
+            suggestionsBox.style.display = "none";
+          };
+          suggestionsBox.appendChild(div);
+        });
+
+        suggestionsBox.style.display = suggestionsBox.children.length ? "block" : "none";
+      } catch (e) {
+        suggestionsBox.style.display = "none";
+      }
+    }
+
+    document.getElementById("companySearch").addEventListener("input", () => {
+      clearTimeout(suggestionTimer);
+      suggestionTimer = setTimeout(fetchSuggestions, 350);
+    });
+
+    async function startDownload() {
+      const startDate = document.getElementById("startDate").value;
+      const endDate = document.getElementById("endDate").value;
+      const errorBox = document.getElementById("errorBox");
+      const progressWrap = document.getElementById("progressWrap");
+      const progressFill = document.getElementById("progressFill");
+      const progressText = document.getElementById("progressText");
+
+      errorBox.textContent = "";
 
       if (!startDate || !endDate) {
         alert("시작일과 종료일을 입력하세요.");
         return;
       }
 
-      const url = `/download?start_date=${encodeURIComponent(startDate)}&end_date=${encodeURIComponent(endDate)}&company=${encodeURIComponent(company)}`;
-      window.location.href = url;
+      progressWrap.style.display = "block";
+      progressFill.style.width = "0%";
+      progressText.textContent = "작업 시작 중...";
+
+      const payload = {
+        start_date: startDate,
+        end_date: endDate,
+        companies: selectedCompanies
+      };
+
+      try {
+        const res = await fetch("/start-download", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify(payload)
+        });
+
+        const data = await res.json();
+
+        if (!data.job_id) {
+          errorBox.textContent = "작업 시작 실패";
+          return;
+        }
+
+        const jobId = data.job_id;
+
+        if (pollTimer) {
+          clearInterval(pollTimer);
+        }
+
+        pollTimer = setInterval(async () => {
+          const statusRes = await fetch(`/job-status/${jobId}`);
+          const status = await statusRes.json();
+
+          if (status.progress) {
+            progressFill.style.width = `${status.progress.percent || 0}%`;
+            progressText.textContent = status.progress.message || "처리 중...";
+          }
+
+          if (status.state === "done") {
+            clearInterval(pollTimer);
+            progressFill.style.width = "100%";
+            progressText.textContent = "완료! 다운로드를 시작합니다.";
+            window.location.href = status.download_url;
+          }
+
+          if (status.state === "error") {
+            clearInterval(pollTimer);
+            errorBox.textContent =
+              (status.error || "오류 발생") +
+              "\n\nstdout:\n" + (status.stdout || "") +
+              "\n\nstderr:\n" + (status.stderr || "");
+            progressText.textContent = "오류가 발생했습니다.";
+          }
+        }, 1500);
+
+      } catch (e) {
+        errorBox.textContent = "요청 중 오류 발생: " + e.message;
+      }
     }
   </script>
 </body>
