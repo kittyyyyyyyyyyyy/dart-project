@@ -1,16 +1,48 @@
 <!DOCTYPE html>
 <html>
 <head>
+  <meta charset="UTF-8">
   <title>DART 데이터 다운로드</title>
 </head>
 <body>
-  <h1>DART 데이터 다운로드</h1>
+  <h1>기업지배구조보고서 다운로드</h1>
 
-  <button onclick="download()">엑셀 다운로드</button>
+  <div>
+    <label>시작일:</label>
+    <input type="date" id="startDate">
+  </div>
+
+  <br>
+
+  <div>
+    <label>종료일:</label>
+    <input type="date" id="endDate">
+  </div>
+
+  <br>
+
+  <div>
+    <label>회사명 (선택):</label>
+    <input type="text" id="company" placeholder="예: 삼성전자">
+  </div>
+
+  <br>
+
+  <button onclick="downloadExcel()">엑셀 다운로드</button>
 
   <script>
-    function download() {
-      window.location.href = "/download";
+    function downloadExcel() {
+      const startDate = document.getElementById("startDate").value;
+      const endDate = document.getElementById("endDate").value;
+      const company = document.getElementById("company").value;
+
+      if (!startDate || !endDate) {
+        alert("시작일과 종료일을 입력하세요.");
+        return;
+      }
+
+      const url = `/download?start_date=${encodeURIComponent(startDate)}&end_date=${encodeURIComponent(endDate)}&company=${encodeURIComponent(company)}`;
+      window.location.href = url;
     }
   </script>
 </body>

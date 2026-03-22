@@ -1,11 +1,10 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.responses import FileResponse, JSONResponse
 import subprocess
 import os
+import uuid
 
 app = FastAPI()
-
-FILE_NAME = "all_table_1_2_2.xlsx"
 
 @app.get("/")
 def root():
@@ -17,40 +16,46 @@ def page():
 
 @app.get("/env-check")
 def env_check():
-    import os
     value = os.getenv("DART_API_KEY")
     return {
         "has_key": bool(value),
         "prefix": value[:5] if value else None
-    }    
+    }
 
 @app.get("/download")
-def download_excel():
+def download_excel(
+    start_date: str = Query(...),
+    end_date: str = Query(...),
+    company: str = Query("")
+):
     try:
-        # 기존 파일 삭제
-        if os.path.exists(FILE_NAME):
-            os.remove(FILE_NAME)
+        file_id = str(uuid.uuid4())[:8]
+        output_file = f"filtered_result_{file_id}.xlsx"
 
-        # 데이터 생성 실행
         result = subprocess.run(
-            ["python3", "extract_all_cg_tables.py"],
+            [
+                "python3",
+                "generate_filtered_excel.py",
+                "--start-date", start_date,
+                "--end-date", end_date,
+                "--company", company,
+                "--output", output_file
+            ],
             capture_output=True,
             text=True
         )
 
-        # 실행 실패 시 에러 내용 반환
         if result.returncode != 0:
             return JSONResponse(
                 status_code=500,
                 content={
-                    "error": "extract_all_cg_tables.py 실행 실패",
+                    "error": "generate_filtered_excel.py 실행 실패",
                     "stdout": result.stdout,
                     "stderr": result.stderr
                 }
             )
 
-        # 파일 생성 확인
-        if not os.path.exists(FILE_NAME):
+        if not os.path.exists(output_file):
             return JSONResponse(
                 status_code=500,
                 content={
@@ -61,8 +66,8 @@ def download_excel():
             )
 
         return FileResponse(
-            path=FILE_NAME,
-            filename=FILE_NAME,
+            path=output_file,
+            filename=output_file,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
@@ -71,4 +76,3 @@ def download_excel():
             status_code=500,
             content={"error": str(e)}
         )
-
