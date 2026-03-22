@@ -234,6 +234,53 @@
     <div class="error-box" id="rmErrorBox"></div>
   </div>
 
+  <div class="section">
+    <h2>국민연금 의결권행사</h2>
+
+    <div class="field">
+      <label>시작일</label><br>
+      <input type="date" id="npsStartDate">
+    </div>
+
+    <div class="field">
+      <label>종료일</label><br>
+      <input type="date" id="npsEndDate">
+    </div>
+
+    <div class="field">
+      <label>회사 선택 방식</label><br>
+      <select id="npsCompanyMode" onchange="toggleCompanyMode('nps')">
+        <option value="all" selected>전부</option>
+        <option value="select">선택</option>
+      </select>
+    </div>
+
+    <div id="npsCompanySelectArea" class="field hidden">
+      <label>회사명 선택</label>
+      <div class="hint">검색 후 추천 목록에서 선택하고, + 버튼으로 여러 회사를 추가하세요.</div>
+      <div id="npsSuggestionStatus" class="hint"></div>
+
+      <div class="row" style="margin-top: 8px;">
+        <input type="text" id="npsCompanySearch" placeholder="회사명을 입력하세요">
+        <button type="button" onclick="addSelectedCompany('nps')">+</button>
+      </div>
+
+      <div id="npsSuggestions" class="suggestions"></div>
+      <div id="npsSelectedCompanies" class="chips"></div>
+    </div>
+
+    <button onclick="startDownload('nps')">엑셀 다운로드</button>
+
+    <div class="progress-wrap" id="npsProgressWrap">
+      <div class="progress-bar-bg">
+        <div class="progress-bar-fill" id="npsProgressFill"></div>
+      </div>
+      <div class="progress-text" id="npsProgressText">대기 중...</div>
+    </div>
+
+    <div class="error-box" id="npsErrorBox"></div>
+  </div>
+
   <script>
     const state = {
       cg: {
@@ -247,8 +294,17 @@
         selectedSuggestion: null,
         pollTimer: null,
         suggestionTimer: null
+      },
+      nps: {
+        selectedCompanies: [],
+        selectedSuggestion: null,
+        pollTimer: null,
+        suggestionTimer: null
       }
     };
+
+    let companyDataset = [];
+    let companyDatasetLower = [];
 
     function setDateRanges() {
       const today = new Date().toISOString().split("T")[0];
@@ -260,6 +316,21 @@
       document.getElementById("rmEndDate").min = "2026-01-01";
       document.getElementById("rmStartDate").max = today;
       document.getElementById("rmEndDate").max = today;
+
+      document.getElementById("npsStartDate").max = today;
+      document.getElementById("npsEndDate").max = today;
+    }
+
+    async function preloadCompanyDataset() {
+      try {
+        const res = await fetch("/company-suggestions-data");
+        const data = await res.json();
+        companyDataset = data.companies || [];
+        companyDatasetLower = companyDataset.map(name => name.toLowerCase());
+      } catch (e) {
+        companyDataset = [];
+        companyDatasetLower = [];
+      }
     }
 
     function toggleCompanyMode(prefix) {
@@ -305,7 +376,30 @@
       renderSelectedCompanies(prefix);
     }
 
-    async function fetchSuggestions(prefix) {
+    function getLocalSuggestions(keyword) {
+      const q = keyword.toLowerCase();
+      const starts = [];
+      const contains = [];
+
+      for (let i = 0; i < companyDataset.length; i++) {
+        const original = companyDataset[i];
+        const lower = companyDatasetLower[i];
+
+        if (lower.startsWith(q)) {
+          starts.push(original);
+        } else if (lower.includes(q)) {
+          contains.push(original);
+        }
+
+        if (starts.length + contains.length >= 20) {
+          break;
+        }
+      }
+
+      return [...starts, ...contains].slice(0, 20);
+    }
+
+    function fetchSuggestions(prefix) {
       const q = document.getElementById(`${prefix}CompanySearch`).value.trim();
       const suggestionsBox = document.getElementById(`${prefix}Suggestions`);
       const statusBox = document.getElementById(`${prefix}SuggestionStatus`);
@@ -314,48 +408,40 @@
       suggestionsBox.innerHTML = "";
 
       if (q.length < 2) {
-  suggestionsBox.style.display = "none";
-  statusBox.textContent = "두 글자 이상 입력하세요.";
-  return;
-}
+        suggestionsBox.style.display = "none";
+        statusBox.textContent = "두 글자 이상 입력하세요.";
+        return;
+      }
 
       statusBox.textContent = "회사명 검색 중...";
 
-      try {
-        const url = `/company-suggestions?q=${encodeURIComponent(q)}`;
-        const res = await fetch(url);
-        const data = await res.json();
+      const results = getLocalSuggestions(q);
 
-        if (!data.companies || data.companies.length === 0) {
-          suggestionsBox.style.display = "none";
-          statusBox.textContent = "일치하는 회사명이 없습니다.";
-          return;
-        }
-
-        data.companies.forEach((company) => {
-          if (state[prefix].selectedCompanies.includes(company)) return;
-
-          const div = document.createElement("div");
-          div.className = "suggestion-item";
-          div.textContent = company;
-          div.onclick = () => {
-            state[prefix].selectedSuggestion = company;
-            document.getElementById(`${prefix}CompanySearch`).value = company;
-            suggestionsBox.style.display = "none";
-            statusBox.textContent = `선택됨: ${company}`;
-          };
-          suggestionsBox.appendChild(div);
-        });
-
-        suggestionsBox.style.display = suggestionsBox.children.length ? "block" : "none";
-        statusBox.textContent = suggestionsBox.children.length
-          ? "추천 목록에서 회사를 선택하세요."
-          : "일치하는 회사명이 없습니다.";
-
-      } catch (e) {
+      if (!results.length) {
         suggestionsBox.style.display = "none";
-        statusBox.textContent = "회사명 추천을 불러오지 못했습니다.";
+        statusBox.textContent = "일치하는 회사명이 없습니다.";
+        return;
       }
+
+      results.forEach((company) => {
+        if (state[prefix].selectedCompanies.includes(company)) return;
+
+        const div = document.createElement("div");
+        div.className = "suggestion-item";
+        div.textContent = company;
+        div.onclick = () => {
+          state[prefix].selectedSuggestion = company;
+          document.getElementById(`${prefix}CompanySearch`).value = company;
+          suggestionsBox.style.display = "none";
+          statusBox.textContent = `선택됨: ${company}`;
+        };
+        suggestionsBox.appendChild(div);
+      });
+
+      suggestionsBox.style.display = suggestionsBox.children.length ? "block" : "none";
+      statusBox.textContent = suggestionsBox.children.length
+        ? "추천 목록에서 회사를 선택하세요."
+        : "일치하는 회사명이 없습니다.";
     }
 
     function addSelectedCompany(prefix) {
@@ -390,7 +476,7 @@
       input.addEventListener("input", () => {
         state[prefix].selectedSuggestion = null;
         clearTimeout(state[prefix].suggestionTimer);
-        state[prefix].suggestionTimer = setTimeout(() => fetchSuggestions(prefix), 180);
+        state[prefix].suggestionTimer = setTimeout(() => fetchSuggestions(prefix), 120);
       });
 
       input.addEventListener("keydown", (e) => {
@@ -402,8 +488,6 @@
     }
 
     async function startDownload(prefix) {
-      const isCg = prefix === "cg";
-
       const startDate = document.getElementById(`${prefix}StartDate`).value;
       const endDate = document.getElementById(`${prefix}EndDate`).value;
       const companyMode = document.getElementById(`${prefix}CompanyMode`).value;
@@ -439,7 +523,9 @@
         companies: companyMode === "all" ? [] : state[prefix].selectedCompanies
       };
 
-      const apiUrl = isCg ? "/start-download" : "/start-regular-download";
+      let apiUrl = "/start-download";
+      if (prefix === "rm") apiUrl = "/start-regular-download";
+      if (prefix === "nps") apiUrl = "/start-nps-download";
 
       try {
         const res = await fetch(apiUrl, {
@@ -494,9 +580,15 @@
       }
     }
 
-    setDateRanges();
-    attachSearchListener("cg");
-    attachSearchListener("rm");
+    async function init() {
+      setDateRanges();
+      attachSearchListener("cg");
+      attachSearchListener("rm");
+      attachSearchListener("nps");
+      await preloadCompanyDataset();
+    }
+
+    init();
   </script>
 </body>
 </html>
