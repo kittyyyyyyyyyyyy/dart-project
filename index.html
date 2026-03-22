@@ -236,8 +236,18 @@
 
   <script>
     const state = {
-      cg: { selectedCompanies: [], selectedSuggestion: null, pollTimer: null, suggestionTimer: null },
-      rm: { selectedCompanies: [], selectedSuggestion: null, pollTimer: null, suggestionTimer: null }
+      cg: {
+        selectedCompanies: [],
+        selectedSuggestion: null,
+        pollTimer: null,
+        suggestionTimer: null
+      },
+      rm: {
+        selectedCompanies: [],
+        selectedSuggestion: null,
+        pollTimer: null,
+        suggestionTimer: null
+      }
     };
 
     function setDateRanges() {
@@ -303,26 +313,18 @@
       state[prefix].selectedSuggestion = null;
       suggestionsBox.innerHTML = "";
 
-      if (q.length < 2) {
+      if (q.length < 1) {
         suggestionsBox.style.display = "none";
-        statusBox.textContent = "두 글자 이상 입력하세요.";
+        statusBox.textContent = "";
         return;
       }
 
       statusBox.textContent = "회사명 검색 중...";
 
       try {
-        const res = await fetch(`/company-suggestions?q=${encodeURIComponent(q)}`);
-        const text = await res.text();
-
-        let data = {};
-        try {
-          data = JSON.parse(text);
-        } catch (e) {
-          suggestionsBox.style.display = "none";
-          statusBox.textContent = "회사명 추천 응답 해석 실패";
-          return;
-        }
+        const url = `/company-suggestions?q=${encodeURIComponent(q)}`;
+        const res = await fetch(url);
+        const data = await res.json();
 
         if (!data.companies || data.companies.length === 0) {
           suggestionsBox.style.display = "none";
@@ -388,7 +390,7 @@
       input.addEventListener("input", () => {
         state[prefix].selectedSuggestion = null;
         clearTimeout(state[prefix].suggestionTimer);
-        state[prefix].suggestionTimer = setTimeout(() => fetchSuggestions(prefix), 180);
+        state[prefix].suggestionTimer = setTimeout(() => fetchSuggestions(prefix), 300);
       });
 
       input.addEventListener("keydown", (e) => {
@@ -400,6 +402,8 @@
     }
 
     async function startDownload(prefix) {
+      const isCg = prefix === "cg";
+
       const startDate = document.getElementById(`${prefix}StartDate`).value;
       const endDate = document.getElementById(`${prefix}EndDate`).value;
       const companyMode = document.getElementById(`${prefix}CompanyMode`).value;
@@ -435,30 +439,21 @@
         companies: companyMode === "all" ? [] : state[prefix].selectedCompanies
       };
 
-      let apiUrl = "/start-download";
-      if (prefix === "rm") apiUrl = "/start-regular-download";
+      const apiUrl = isCg ? "/start-download" : "/start-regular-download";
 
       try {
         const res = await fetch(apiUrl, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json"
+          },
           body: JSON.stringify(payload)
         });
 
-        const rawText = await res.text();
-
-        let data = {};
-        try {
-          data = JSON.parse(rawText);
-        } catch (e) {
-          errorBox.textContent =
-            "작업 시작 실패\n\n응답(JSON 아님):\n" + rawText;
-          return;
-        }
+        const data = await res.json();
 
         if (!data.job_id) {
-          errorBox.textContent =
-            "작업 시작 실패\n\n응답:\n" + JSON.stringify(data, null, 2);
+          errorBox.textContent = "작업 시작 실패";
           return;
         }
 
@@ -470,16 +465,7 @@
 
         state[prefix].pollTimer = setInterval(async () => {
           const statusRes = await fetch(`/job-status/${jobId}`);
-          const statusText = await statusRes.text();
-
-          let status = {};
-          try {
-            status = JSON.parse(statusText);
-          } catch (e) {
-            errorBox.textContent = "상태 조회 실패\n\n응답:\n" + statusText;
-            clearInterval(state[prefix].pollTimer);
-            return;
-          }
+          const status = await statusRes.json();
 
           if (status.progress) {
             progressFill.style.width = `${status.progress.percent || 0}%`;
@@ -508,13 +494,9 @@
       }
     }
 
-    function init() {
-      setDateRanges();
-      attachSearchListener("cg");
-      attachSearchListener("rm");
-    }
-
-    init();
+    setDateRanges();
+    attachSearchListener("cg");
+    attachSearchListener("rm");
   </script>
 </body>
 </html>
