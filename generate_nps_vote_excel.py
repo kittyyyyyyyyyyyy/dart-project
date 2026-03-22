@@ -63,7 +63,7 @@ def chunk_date_ranges(start_date_str, end_date_str, chunk_days=30):
 
     while current <= end:
         chunk_end = min(current + timedelta(days=chunk_days - 1), end)
-        ranges.append((current.strftime("%Y-%m-%d"), chunk_end.strftime("%Y-%m-%d")))
+        ranges.append((current.strftime("%Y%m%d"), chunk_end.strftime("%Y%m%d")))
         current = chunk_end + timedelta(days=1)
 
     return ranges
@@ -73,7 +73,6 @@ def normalize_agenda_no(text: str):
     if not text:
         return ""
     text = str(text).strip()
-    # 예: 제1호, 1호, 의안 1, 1. -> 1
     m = re.search(r"(\d+(?:-\d+)?)", text)
     return m.group(1) if m else ""
 
@@ -81,16 +80,25 @@ def normalize_agenda_no(text: str):
 # -----------------------------
 # 국민연금 목록 수집
 # -----------------------------
+def parse_go_detail_args(raw):
+    """
+    javascript:fnc_goDetail('','0095000','00010','20260320','1');
+    -> ["", "0095000", "00010", "20260320", "1"]
+    """
+    m = re.search(r"fnc_goDetail\((.*?)\)", raw)
+    if not m:
+        return []
+
+    inside = m.group(1)
+    args = re.findall(r"'(.*?)'", inside)
+    return args
+
+
 def fetch_nps_vote_list(start_date, end_date, company_names=None, progress_file=None):
     """
-    국민연금 국내 의결권 행사내역 목록 수집
-
-    주의:
-    - 아래 payload 이름은 실제 사이트 전송 이름과 다를 수 있음
-    - 첫 배포 후 실제 목록 응답 HTML 기준으로 1회 조정 필요 가능
+    국민연금 목록 페이지 전체 페이지 순회
     """
     base_url = "https://fund.nps.or.kr/impa/edwmpblnt/getOHEF0007M0.do"
-
     company_set = set(company_names or [])
     all_rows = []
 
@@ -100,72 +108,86 @@ def fetch_nps_vote_list(start_date, end_date, company_names=None, progress_file=
 
     for s_date, e_date in date_ranges:
         step += 1
-        percent = min(25, 5 + int((step / max(1, total_steps)) * 20))
-        write_progress(
-            progress_file,
-            "running",
-            percent,
-            f"국민연금 목록 조회 중... ({s_date} ~ {e_date})",
-            step,
-            total_steps
-        )
+        base_percent = min(25, 5 + int((step / max(1, total_steps)) * 20))
 
-        # 1차 구현: GET 파라미터 기반 시도
-        # 실제 사이트 구조에 따라 POST/form 파라미터로 바뀔 수 있음
-        params = {
-            "searchText": "",
-            "searchFromDate": s_date.replace("-", ""),
-            "searchToDate": e_date.replace("-", "")
-        }
+        page_index = 1
+        while True:
+            write_progress(
+                progress_file,
+                "running",
+                base_percent,
+                f"국민연금 목록 조회 중... ({s_date}~{e_date}, page {page_index})",
+                step,
+                total_steps
+            )
 
-        res = http.get(base_url, params=params, timeout=(30, 120))
-        res.raise_for_status()
+            params = {
+                "menuId": "MN24000636",
+                "searchFromDate": s_date,
+                "searchToDate": e_date,
+                "pageIndex": page_index
+            }
 
-        soup = BeautifulSoup(res.text, "lxml")
+            res = http.get(base_url, params=params, timeout=(30, 120))
+            res.raise_for_status()
 
-        # 목록 페이지에서 테이블 행 추정
-        # 실제 사이트 구조에 따라 selector는 1회 조정 가능
-        rows = soup.select("table tbody tr")
-        if not rows:
-            # fallback: 화면상 텍스트 파싱
-            text = soup.get_text("\n", strip=True)
-            # 구조가 바뀐 경우 대비, 여기서는 pass
-            continue
+            soup = BeautifulSoup(res.text, "lxml")
+            rows = soup.select("table tbody tr")
 
-        for tr in rows:
-            cols = [td.get_text(" ", strip=True) for td in tr.select("td")]
-            if len(cols) < 5:
-                continue
+            if not rows:
+                break
 
-            # 예상 컬럼: 번호, 회사명, 코드, 주총일자, 구분
-            no = cols[0]
-            corp_name = cols[1]
-            stock_code = cols[2]
-            meeting_date = cols[3]
-            category = cols[4]
+            page_items = 0
 
-            if "정기주총" not in category:
-                continue
+            for tr in rows:
+                cols = [td.get_text(" ", strip=True) for td in tr.select("td")]
+                if len(cols) < 5:
+                    continue
 
-            if company_set and corp_name not in company_set:
-                continue
+                no = cols[0]
+                corp_name = cols[1]
+                stock_code = cols[2]
+                meeting_date = cols[3]
+                category = cols[4]
 
-            # 상세 진입 링크 / onclick / data-* 추출
-            link = tr.select_one("a")
-            detail_href = link.get("href", "") if link else ""
-            onclick = link.get("onclick", "") if link else ""
+                if "정기주총" not in category:
+                    continue
 
-            all_rows.append({
-                "no": no,
-                "corp_name": corp_name,
-                "stock_code": stock_code,
-                "meeting_date": meeting_date,
-                "category": category,
-                "detail_href": detail_href,
-                "onclick": onclick
-            })
+                if company_set and corp_name not in company_set:
+                    continue
 
-        time.sleep(0.2)
+                link = tr.select_one("a")
+                href = link.get("href", "") if link else ""
+                onclick = link.get("onclick", "") if link else ""
+
+                raw_js = href if href.startswith("javascript:") else onclick
+                detail_args = parse_go_detail_args(raw_js)
+
+                all_rows.append({
+                    "no": no,
+                    "corp_name": corp_name,
+                    "stock_code": stock_code,
+                    "meeting_date": meeting_date,
+                    "category": category,
+                    "detail_args": detail_args
+                })
+                page_items += 1
+
+            # 국민연금 목록은 화면상 10건 단위 페이지 구조
+            # 한 페이지에서 0건이면 종료
+            if page_items == 0:
+                break
+
+            # 다음 페이지 존재 여부: 현재 페이지 숫자 링크/다음 텍스트 기준으로 추정
+            page_text = soup.get_text(" ", strip=True)
+            if "다음" not in page_text and page_items < 10:
+                break
+
+            if page_items < 10:
+                break
+
+            page_index += 1
+            time.sleep(0.15)
 
     # 중복 제거
     dedup = {}
@@ -181,47 +203,45 @@ def fetch_nps_vote_list(start_date, end_date, company_names=None, progress_file=
 # -----------------------------
 def fetch_nps_detail_table(item):
     """
-    국민연금 상세 페이지 수집
+    detail_args 예시:
+    ["", "0095000", "00010", "20260320", "1"]
 
-    매우 중요:
-    이 함수는 실제 사이트의 상세 진입 방식에 따라 1회 조정 가능성이 큼.
-    현재는 href / onclick 기반의 뼈대만 제공.
+    사이트 패턴상 M0(list) -> M1(detail)로 넘어가는 구조를 우선 사용.
     """
-    base = "https://fund.nps.or.kr"
+    args = item.get("detail_args", [])
+    if len(args) < 5:
+        return []
 
-    # 1) href가 실제 URL인 경우
-    if item.get("detail_href"):
-        href = item["detail_href"]
-        if href.startswith("/"):
-            url = base + href
-        elif href.startswith("http"):
-            url = href
-        else:
-            url = base + "/" + href.lstrip("/")
+    arg0, arg1, arg2, arg3, arg4 = args
 
-        res = http.get(url, timeout=(30, 120))
-        res.raise_for_status()
-        return parse_nps_detail_html(res.text)
+    detail_url = "https://fund.nps.or.kr/impa/edwmpblnt/getOHEF0007M1.do"
 
-    # 2) onclick 안에 파라미터가 있는 경우
-    # 예: fnView('...', '...')
-    onclick = item.get("onclick", "")
-    if onclick:
-        # 필요 시 여기서 정규식으로 파라미터 추출
-        # 현재는 placeholder
-        pass
+    # 사이트 구조상 실제 파라미터명이 다를 수 있으나,
+    # fnc_goDetail에서 넘기는 5개 값을 그대로 전달하는 방식으로 우선 구성
+    params = {
+        "menuId": "MN24000636",
+        "arg0": arg0,
+        "arg1": arg1,
+        "arg2": arg2,
+        "arg3": arg3,
+        "arg4": arg4
+    }
 
-    # 상세 진입 실패
-    return []
+    res = http.get(detail_url, params=params, timeout=(30, 120))
+    res.raise_for_status()
+
+    return parse_nps_detail_html(res.text)
 
 
 def parse_nps_detail_html(html_text):
     soup = BeautifulSoup(html_text, "lxml")
 
-    # 상세 표 selector는 첫 배포 후 1회 조정 가능
-    table = soup.select_one("table")
-    if not table:
+    tables = soup.select("table")
+    if not tables:
         return []
+
+    # 가장 큰 표를 상세표로 사용
+    table = max(tables, key=lambda t: len(t.select("tr")))
 
     rows = []
     for tr in table.select("tr"):
@@ -229,10 +249,9 @@ def parse_nps_detail_html(html_text):
         if cols:
             rows.append(cols)
 
-    if not rows:
+    if not rows or len(rows) < 2:
         return []
 
-    # 첫 줄을 헤더로 사용
     header = rows[0]
     data_rows = rows[1:]
 
@@ -242,10 +261,8 @@ def parse_nps_detail_html(html_text):
         for i, value in enumerate(row, start=1):
             item[f"nps_col_{i}"] = value
 
-        # 의안번호 후보
         joined = " ".join(row)
         item["agenda_no_norm"] = normalize_agenda_no(joined)
-
         normalized.append(item)
 
     return normalized
@@ -255,9 +272,6 @@ def parse_nps_detail_html(html_text):
 # DART 주주총회소집공고 수집
 # -----------------------------
 def fetch_dart_meeting_notice(corp_name, meeting_date):
-    """
-    같은 회사/시기 기준으로 주주총회소집공고 검색
-    """
     url = "https://opendart.fss.or.kr/api/list.json"
 
     dt = datetime.strptime(meeting_date.replace("/", "-"), "%Y-%m-%d")
@@ -292,23 +306,24 @@ def fetch_dart_meeting_notice(corp_name, meeting_date):
             if not items:
                 break
 
-            for item in items:
-                name = str(item.get("corp_name", ""))
-                report_nm = str(item.get("report_nm", ""))
+            for it in items:
+                name = str(it.get("corp_name", ""))
+                report_nm = str(it.get("report_nm", ""))
 
                 if name != corp_name:
                     continue
                 if "주주총회소집" not in report_nm:
                     continue
 
-                found.append(item)
+                found.append(it)
 
             if len(items) < 50:
                 break
-            page_no += 1
-            time.sleep(0.15)
 
-    return found[:1]  # 가장 가까운 1건 사용
+            page_no += 1
+            time.sleep(0.12)
+
+    return found[:1]
 
 
 def download_dart_document(rcept_no):
@@ -353,7 +368,6 @@ def extract_dart_agendas(file_path):
 
     soup = BeautifulSoup(content, "lxml")
 
-    # "부의안건" 텍스트 주변 표 탐색
     target = None
     for tag in soup.find_all(string=True):
         txt = tag.strip()
@@ -504,7 +518,7 @@ def main():
         except Exception as e:
             fail_rows.append([corp_name, stock_code, meeting_date, f"error: {str(e)}"])
 
-        time.sleep(0.15)
+        time.sleep(0.12)
 
     result_df = pd.DataFrame(all_rows)
     fail_df = pd.DataFrame(fail_rows, columns=["corp_name", "stock_code", "meeting_date", "reason"])
