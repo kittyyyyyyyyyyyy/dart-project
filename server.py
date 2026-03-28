@@ -19,6 +19,8 @@ app = FastAPI()
 API_KEY = os.getenv("DART_API_KEY")
 jobs = {}
 
+COMPANY_CACHE_FILE = "company_names.json"
+
 company_cache = {
     "loaded_at": 0,
     "names": []
@@ -44,47 +46,85 @@ def make_session():
 http = make_session()
 
 
-def load_all_company_names():
-    """
-    OpenDART corpCode.xml 기반 전체 회사명 로드
-    12시간 캐시
-    """
-    now = time.time()
-    if company_cache["names"] and (now - company_cache["loaded_at"] < 60 * 60 * 12):
-        return company_cache["names"]
+def save_company_names_to_file(names):
+    with open(COMPANY_CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(names, f, ensure_ascii=False)
 
+
+def load_company_names_from_file():
+    if not os.path.exists(COMPANY_CACHE_FILE):
+        return []
+
+    try:
+        with open(COMPANY_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def fetch_company_names_from_dart():
     if not API_KEY:
         return []
 
     url = "https://opendart.fss.or.kr/api/corpCode.xml"
     params = {"crtfc_key": API_KEY}
 
-    try:
-        res = http.get(url, params=params, timeout=(60, 180))
-        z = zipfile.ZipFile(io.BytesIO(res.content))
+    res = http.get(url, params=params, timeout=(60, 180))
+    z = zipfile.ZipFile(io.BytesIO(res.content))
 
-        xml_filename = z.namelist()[0]
-        xml_content = z.read(xml_filename)
+    xml_filename = z.namelist()[0]
+    xml_content = z.read(xml_filename)
 
-        root = ET.fromstring(xml_content)
+    root = ET.fromstring(xml_content)
 
-        names = set()
-        for item in root.findall("list"):
-            corp_name = item.findtext("corp_name", default="").strip()
-            stock_code = item.findtext("stock_code", default="").strip()
+    names = set()
+    for item in root.findall("list"):
+        corp_name = item.findtext("corp_name", default="").strip()
+        stock_code = item.findtext("stock_code", default="").strip()
+        if corp_name and stock_code:
+            names.add(corp_name)
 
-            # 상장사만 추천
-            if corp_name and stock_code:
-                names.add(corp_name)
+    return sorted(names)
 
-        result = sorted(names)
-        company_cache["loaded_at"] = now
-        company_cache["names"] = result
-        return result
 
-    except Exception as e:
-        print("회사명 목록 로드 실패:", str(e))
+def ensure_company_cache_loaded():
+    if company_cache["names"]:
         return company_cache["names"]
+
+    file_names = load_company_names_from_file()
+    if file_names:
+        company_cache["names"] = file_names
+        company_cache["loaded_at"] = time.time()
+        return file_names
+
+    try:
+        names = fetch_company_names_from_dart()
+        company_cache["names"] = names
+        company_cache["loaded_at"] = time.time()
+        save_company_names_to_file(names)
+        return names
+    except Exception as e:
+        print("회사명 목록 초기 로드 실패:", str(e))
+        return []
+
+
+def refresh_company_cache_in_background():
+    try:
+        names = fetch_company_names_from_dart()
+        if names:
+            company_cache["names"] = names
+            company_cache["loaded_at"] = time.time()
+            save_company_names_to_file(names)
+            print(f"회사명 캐시 갱신 완료: {len(names)}개")
+    except Exception as e:
+        print("회사명 캐시 백그라운드 갱신 실패:", str(e))
+
+
+@app.on_event("startup")
+def startup_event():
+    ensure_company_cache_loaded()
+    t = threading.Thread(target=refresh_company_cache_in_background, daemon=True)
+    t.start()
 
 
 class DownloadRequest(BaseModel):
@@ -129,9 +169,9 @@ def env_check():
 def company_suggestions(q: str = Query(...)):
     keyword = q.strip()
     if not keyword:
-        return {"companies": []}
+        return {"companies": [], "count": 0}
 
-    all_names = load_all_company_names()
+    all_names = ensure_company_cache_loaded()
     q_lower = keyword.lower()
 
     starts = []
@@ -144,12 +184,11 @@ def company_suggestions(q: str = Query(...)):
         elif q_lower in lower_name:
             contains.append(name)
 
-    matched = (starts + contains)[:20]
+        if len(starts) + len(contains) >= 20:
+            break
 
-    return {
-        "companies": matched,
-        "count": len(matched)
-    }
+    matched = (starts + contains)[:20]
+    return {"companies": matched, "count": len(matched)}
 
 
 @app.post("/start-download")
@@ -253,11 +292,7 @@ def job_status(job_id: str):
             pass
 
     if proc.poll() is None:
-        return {
-            "job_id": job_id,
-            "state": "running",
-            "progress": progress
-        }
+        return {"job_id": job_id, "state": "running", "progress": progress}
 
     if job["returncode"] != 0:
         return {

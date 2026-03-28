@@ -10,45 +10,31 @@
       margin: 40px auto;
       line-height: 1.5;
     }
-
     h2 {
       margin-top: 40px;
       margin-bottom: 18px;
       padding-bottom: 8px;
       border-bottom: 2px solid #ddd;
     }
-
-    .section {
-      margin-bottom: 50px;
-    }
-
-    .field {
-      margin-bottom: 18px;
-    }
-
-    label {
-      font-weight: bold;
-    }
-
+    .section { margin-bottom: 50px; }
+    .field { margin-bottom: 18px; }
+    label { font-weight: bold; }
     input[type="date"], input[type="text"], select {
       padding: 8px;
       width: 320px;
       font-size: 14px;
     }
-
     button {
       padding: 10px 14px;
       cursor: pointer;
       font-size: 14px;
     }
-
     .row {
       display: flex;
       gap: 10px;
       align-items: center;
       flex-wrap: wrap;
     }
-
     .suggestions {
       border: 1px solid #ccc;
       width: 320px;
@@ -58,24 +44,18 @@
       display: none;
       background: white;
     }
-
     .suggestion-item {
       padding: 8px;
       cursor: pointer;
       border-bottom: 1px solid #eee;
     }
-
-    .suggestion-item:hover {
-      background: #f5f5f5;
-    }
-
+    .suggestion-item:hover { background: #f5f5f5; }
     .chips {
       margin-top: 10px;
       display: flex;
       flex-wrap: wrap;
       gap: 8px;
     }
-
     .chip {
       background: #eef3ff;
       border: 1px solid #b7c8ff;
@@ -86,7 +66,6 @@
       gap: 8px;
       font-size: 14px;
     }
-
     .chip button {
       border: none;
       background: transparent;
@@ -95,12 +74,10 @@
       cursor: pointer;
       padding: 0;
     }
-
     .progress-wrap {
       margin-top: 24px;
       display: none;
     }
-
     .progress-bar-bg {
       width: 100%;
       height: 24px;
@@ -108,35 +85,28 @@
       border-radius: 12px;
       overflow: hidden;
     }
-
     .progress-bar-fill {
       height: 100%;
       width: 0%;
       background: #4a78ff;
       transition: width 0.4s ease;
     }
-
     .progress-text {
       margin-top: 8px;
       font-size: 14px;
     }
-
     .error-box {
       margin-top: 16px;
       color: #b00020;
       white-space: pre-wrap;
       font-size: 13px;
     }
-
     .hint {
       font-size: 13px;
       color: #666;
       margin-top: 6px;
     }
-
-    .hidden {
-      display: none;
-    }
+    .hidden { display: none; }
   </style>
 </head>
 <body>
@@ -236,26 +206,14 @@
 
   <script>
     const state = {
-      cg: {
-        selectedCompanies: [],
-        selectedSuggestion: null,
-        pollTimer: null,
-        suggestionTimer: null
-      },
-      rm: {
-        selectedCompanies: [],
-        selectedSuggestion: null,
-        pollTimer: null,
-        suggestionTimer: null
-      }
+      cg: { selectedCompanies: [], selectedSuggestion: null, pollTimer: null, suggestionTimer: null },
+      rm: { selectedCompanies: [], selectedSuggestion: null, pollTimer: null, suggestionTimer: null }
     };
 
     function setDateRanges() {
       const today = new Date().toISOString().split("T")[0];
-
       document.getElementById("cgStartDate").max = today;
       document.getElementById("cgEndDate").max = today;
-
       document.getElementById("rmStartDate").min = "2026-01-01";
       document.getElementById("rmEndDate").min = "2026-01-01";
       document.getElementById("rmStartDate").max = today;
@@ -313,18 +271,26 @@
       state[prefix].selectedSuggestion = null;
       suggestionsBox.innerHTML = "";
 
-      if (q.length < 1) {
+      if (q.length < 2) {
         suggestionsBox.style.display = "none";
-        statusBox.textContent = "";
+        statusBox.textContent = "두 글자 이상 입력하세요.";
         return;
       }
 
       statusBox.textContent = "회사명 검색 중...";
 
       try {
-        const url = `/company-suggestions?q=${encodeURIComponent(q)}`;
-        const res = await fetch(url);
-        const data = await res.json();
+        const res = await fetch(`/company-suggestions?q=${encodeURIComponent(q)}`);
+        const text = await res.text();
+
+        let data = {};
+        try {
+          data = JSON.parse(text);
+        } catch {
+          suggestionsBox.style.display = "none";
+          statusBox.textContent = "회사명 추천 응답 해석 실패";
+          return;
+        }
 
         if (!data.companies || data.companies.length === 0) {
           suggestionsBox.style.display = "none";
@@ -352,7 +318,7 @@
           ? "추천 목록에서 회사를 선택하세요."
           : "일치하는 회사명이 없습니다.";
 
-      } catch (e) {
+      } catch {
         suggestionsBox.style.display = "none";
         statusBox.textContent = "회사명 추천을 불러오지 못했습니다.";
       }
@@ -386,11 +352,10 @@
 
     function attachSearchListener(prefix) {
       const input = document.getElementById(`${prefix}CompanySearch`);
-
       input.addEventListener("input", () => {
         state[prefix].selectedSuggestion = null;
         clearTimeout(state[prefix].suggestionTimer);
-        state[prefix].suggestionTimer = setTimeout(() => fetchSuggestions(prefix), 300);
+        state[prefix].suggestionTimer = setTimeout(() => fetchSuggestions(prefix), 180);
       });
 
       input.addEventListener("keydown", (e) => {
@@ -402,8 +367,6 @@
     }
 
     async function startDownload(prefix) {
-      const isCg = prefix === "cg";
-
       const startDate = document.getElementById(`${prefix}StartDate`).value;
       const endDate = document.getElementById(`${prefix}EndDate`).value;
       const companyMode = document.getElementById(`${prefix}CompanyMode`).value;
@@ -439,21 +402,28 @@
         companies: companyMode === "all" ? [] : state[prefix].selectedCompanies
       };
 
-      const apiUrl = isCg ? "/start-download" : "/start-regular-download";
+      let apiUrl = "/start-download";
+      if (prefix === "rm") apiUrl = "/start-regular-download";
 
       try {
         const res = await fetch(apiUrl, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json"
-          },
+          headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload)
         });
 
-        const data = await res.json();
+        const rawText = await res.text();
+
+        let data = {};
+        try {
+          data = JSON.parse(rawText);
+        } catch {
+          errorBox.textContent = "작업 시작 실패\n\n응답(JSON 아님):\n" + rawText;
+          return;
+        }
 
         if (!data.job_id) {
-          errorBox.textContent = "작업 시작 실패";
+          errorBox.textContent = "작업 시작 실패\n\n응답:\n" + JSON.stringify(data, null, 2);
           return;
         }
 
@@ -465,7 +435,16 @@
 
         state[prefix].pollTimer = setInterval(async () => {
           const statusRes = await fetch(`/job-status/${jobId}`);
-          const status = await statusRes.json();
+          const statusText = await statusRes.text();
+
+          let status = {};
+          try {
+            status = JSON.parse(statusText);
+          } catch {
+            errorBox.textContent = "상태 조회 실패\n\n응답:\n" + statusText;
+            clearInterval(state[prefix].pollTimer);
+            return;
+          }
 
           if (status.progress) {
             progressFill.style.width = `${status.progress.percent || 0}%`;
@@ -494,9 +473,13 @@
       }
     }
 
-    setDateRanges();
-    attachSearchListener("cg");
-    attachSearchListener("rm");
+    function init() {
+      setDateRanges();
+      attachSearchListener("cg");
+      attachSearchListener("rm");
+    }
+
+    init();
   </script>
 </body>
 </html>
