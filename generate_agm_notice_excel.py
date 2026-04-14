@@ -74,25 +74,47 @@ def call_bedrock(prompt):
 
 
 def extract_json(text):
-    """AI 응답 텍스트에서 JSON 객체를 추출한다."""
+    """
+    AI 응답 텍스트에서 JSON 객체를 추출한다.
+    코드블록(```json```) 제거 후 중괄호 depth 추적으로 정확하게 파싱한다.
+    """
+    # 1차: 코드블록 마커 제거 후 직접 파싱
+    cleaned = re.sub(r'```(?:json)?\s*', '', text)
+    cleaned = re.sub(r'```', '', cleaned).strip()
     try:
-        return json.loads(text)
+        return json.loads(cleaned)
     except Exception:
         pass
-    # 코드블록 안에 있는 경우 처리
-    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(1))
-        except Exception:
-            pass
-    # 중괄호 범위로 추출
-    m = re.search(r"\{.*\}", text, re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group())
-        except Exception:
-            pass
+
+    # 2차: 중괄호 depth를 추적해 완전한 JSON 객체 범위를 정확히 찾아 파싱
+    start = text.find('{')
+    if start == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    escape_next = False
+
+    for i, char in enumerate(text[start:], start):
+        if escape_next:
+            escape_next = False
+            continue
+        if char == '\\' and in_string:
+            escape_next = True
+            continue
+        if char == '"':
+            in_string = not in_string
+        if not in_string:
+            if char == '{':
+                depth += 1
+            elif char == '}':
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(text[start:i + 1])
+                    except Exception:
+                        pass
+
     return None
 
 
@@ -306,6 +328,11 @@ def parse_and_analyze_with_ai(notice_text, corp_name, full_text_fallback=""):
    - proposer: shareholder_proposal이 "Y"이면 제안 주주명, 아니면 ""
    - category1: "재무제표승인" / "이사감사선임" / "정관변경" / "이사감사보수" / "자사주보유처분계획승인" / "기타" 중 하나
    - category2: category1이 "정관변경"일 때만 "이사 임기 유연화" / "이사 임기 연장" / "이사 정원 축소" / "자사주 보유" / "기타 개정 상법 반영" 중 하나, 나머지는 ""
+
+반환 규칙:
+- 반드시 순수 JSON만 반환할 것
+- 코드블록(```) 절대 사용 금지
+- 설명 텍스트 없이 JSON 객체만 출력
 
 반환 형식:
 {{"meeting_date": "...", "agenda_items": [{{"num": "1", "title": "...", "shareholder_proposal": "N", "proposer": "", "category1": "...", "category2": ""}}]}}"""
