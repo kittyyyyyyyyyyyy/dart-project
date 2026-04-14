@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 import json
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import httpx
 from openai import OpenAI
 
 load_dotenv()
@@ -37,7 +38,23 @@ def make_session():
 
 
 http = make_session()
-openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+
+def create_openai_client():
+    if not OPENAI_API_KEY:
+        return None
+    try:
+        return OpenAI(
+            api_key=OPENAI_API_KEY,
+            max_retries=3,
+            timeout=httpx.Timeout(60.0, connect=15.0)
+        )
+    except Exception as e:
+        print(f"OpenAI 클라이언트 생성 실패: {e}")
+        return None
+
+
+openai_client = create_openai_client()
 
 
 def write_progress(progress_file, status, percent, message, current=0, total=0):
