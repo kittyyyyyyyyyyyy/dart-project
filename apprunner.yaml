@@ -18,3 +18,5 @@ run:
       value-from: "arn:aws:secretsmanager:us-east-1:149997403349:secret:DART_API_KEY-DcBt2m"
     - name: OPENAI_API_KEY
       value-from: "arn:aws:secretsmanager:us-east-1:149997403349:secret:open_ai_api-ra3PxX"
+
+
