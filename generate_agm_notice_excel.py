@@ -163,16 +163,23 @@ def extract_text_sections(file_path):
     HTML 문서에서 두 섹션을 추출한다:
     - notice_text: 주주총회 소집공고 섹션 (일시, 결의사항 포함)
     - section2_text: 주주총회 목적사항별 기재사항 섹션 (안건 상세 내용)
+    - full_text: 전체 텍스트 (notice_text가 짧을 경우 AI fallback용)
     """
     with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
         content = f.read()
 
     soup = BeautifulSoup(content, "lxml")
+
+    # 공백/빈줄 정리해서 텍스트 추출
+    import re as _re
     full_text = soup.get_text('\n')
+    full_text = _re.sub(r'\n{4,}', '\n\n', full_text)
+    full_text = _re.sub(r'[ \t]{3,}', '  ', full_text)
 
     # 소집공고 섹션 시작점 찾기
     notice_start = 0
-    for kw in ["주주총회 소집공고", "주주총회소집공고", "소 집 공 고"]:
+    for kw in ["주주총회 소집공고", "주주총회소집공고", "소 집 공 고",
+               "주주총 회 소집공고", "주 주 총 회 소 집 공 고"]:
         idx = full_text.find(kw)
         if idx != -1:
             notice_start = idx
@@ -181,28 +188,28 @@ def extract_text_sections(file_path):
     # 목적사항별 기재사항 섹션 시작점 찾기
     section2_start = -1
     for kw in ["주주총회 목적사항별 기재사항", "주주총회목적사항별기재사항",
-               "목적사항별 기재사항", "목 적 사 항 별 기 재 사 항"]:
+               "목적사항별 기재사항", "목 적 사 항 별 기 재 사 항",
+               "주주총회목적사항별기재사항"]:
         idx = full_text.find(kw, notice_start)
         if idx != -1:
             section2_start = idx
             break
 
     if section2_start == -1:
-        # section2가 없으면 소집공고 전체를 notice로
-        notice_text = full_text[notice_start:notice_start + 6000]
+        notice_text = full_text[notice_start:notice_start + 8000]
         section2_text = ""
     else:
         notice_text = full_text[notice_start:section2_start]
         section2_text = full_text[section2_start:section2_start + 60000]
 
-    return notice_text, section2_text
+    return notice_text, section2_text, full_text
 
 
 # ─────────────────────────────────────────────
 # 3. AI로 소집공고 섹션 파싱 + G/H/I/J 분석 통합
 # ─────────────────────────────────────────────
 
-def parse_and_analyze_with_ai(notice_text, corp_name):
+def parse_and_analyze_with_ai(notice_text, corp_name, full_text_fallback=""):
     """
     소집공고 섹션 텍스트를 AI에게 넘겨 아래 내용을 한번에 추출·분석한다:
     - 주총일 (D열)
@@ -212,18 +219,23 @@ def parse_and_analyze_with_ai(notice_text, corp_name):
 
     반환: {
         meeting_date: str,
-        agenda_items: [
-            {num, title, shareholder_proposal, proposer, category1, category2}
-        ]
+        agenda_items: [...],
+        error: str  # 실패 시 원인
     }
     """
     if not openai_client:
-        return {"meeting_date": "", "agenda_items": []}
+        return {"meeting_date": "", "agenda_items": [],
+                "error": "openai_client_none:OPENAI_API_KEY 환경변수 미설정"}
 
-    # 토큰 절약을 위해 6000자로 제한
-    text_excerpt = notice_text[:6000]
+    # notice_text가 너무 짧으면 full_text 앞부분으로 fallback
+    text_to_use = notice_text
+    if len(notice_text.strip()) < 300 and full_text_fallback:
+        text_to_use = full_text_fallback[:8000]
 
-    prompt = f"""다음은 "{corp_name}"의 주주총회소집공고 문서 중 소집공고 섹션입니다.
+    # 토큰 절약을 위해 7000자로 제한
+    text_excerpt = text_to_use[:7000]
+
+    prompt = f"""다음은 "{corp_name}"의 주주총회소집공고 문서 내용입니다.
 
 {text_excerpt}
 
@@ -289,10 +301,12 @@ def parse_and_analyze_with_ai(notice_text, corp_name):
             max_tokens=3000
         )
         result = json.loads(response.choices[0].message.content)
+        result.setdefault("error", "")
         return result
     except Exception as e:
-        print(f"AI 파싱/분석 오류 ({corp_name}): {e}")
-        return {"meeting_date": "", "agenda_items": []}
+        err_msg = str(e)
+        print(f"AI 파싱/분석 오류 ({corp_name}): {err_msg}")
+        return {"meeting_date": "", "agenda_items": [], "error": f"openai_exception:{err_msg[:200]}"}
 
 
 # ─────────────────────────────────────────────
@@ -450,20 +464,20 @@ def main():
 
         try:
             # 소집공고 섹션 / 목적사항별 기재사항 섹션 분리 추출
-            notice_text, section2_text = extract_text_sections(main_file)
-
-            if not notice_text.strip():
-                fail_list.append([corp_name, stock_code, rcept_no, "notice_section_not_found"])
-                shutil.rmtree(folder_name, ignore_errors=True)
-                continue
+            notice_text, section2_text, full_text = extract_text_sections(main_file)
 
             # AI로 D/E열 파싱 + G/H/I/J열 분석 (보고서 1건당 1회 호출)
-            parsed = parse_and_analyze_with_ai(notice_text, corp_name)
+            # notice_text가 짧으면 full_text를 fallback으로 전달
+            parsed = parse_and_analyze_with_ai(notice_text, corp_name,
+                                               full_text_fallback=full_text)
             meeting_date = parsed.get("meeting_date", "")
             agenda_items = parsed.get("agenda_items", [])
+            ai_error = parsed.get("error", "")
 
             if not agenda_items:
-                fail_list.append([corp_name, stock_code, rcept_no, "ai_returned_no_agenda_items"])
+                # 원인을 구체적으로 기록 (OPENAI_API_KEY 미설정인지, AI가 빈값 반환인지 등)
+                reason = ai_error if ai_error else "ai_returned_no_agenda_items"
+                fail_list.append([corp_name, stock_code, rcept_no, reason])
                 shutil.rmtree(folder_name, ignore_errors=True)
                 continue
 
