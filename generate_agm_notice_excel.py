@@ -12,13 +12,14 @@ from datetime import datetime, timedelta
 import json
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import httpx
-from openai import OpenAI
+import boto3
+import re
 
 load_dotenv()
 
 API_KEY = os.getenv("DART_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+AWS_REGION = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
+BEDROCK_MODEL_ID = "anthropic.claude-3-haiku-20240307-v1:0"
 
 if not API_KEY:
     raise ValueError("DART_API_KEY가 없습니다. .env 또는 환경 변수를 확인하세요.")
@@ -40,21 +41,58 @@ def make_session():
 http = make_session()
 
 
-def create_openai_client():
-    if not OPENAI_API_KEY:
-        return None
+def create_bedrock_client():
     try:
-        return OpenAI(
-            api_key=OPENAI_API_KEY,
-            max_retries=3,
-            timeout=httpx.Timeout(60.0, connect=15.0)
-        )
+        return boto3.client("bedrock-runtime", region_name=AWS_REGION)
     except Exception as e:
-        print(f"OpenAI 클라이언트 생성 실패: {e}")
+        print(f"Bedrock 클라이언트 생성 실패: {e}")
         return None
 
 
-openai_client = create_openai_client()
+bedrock_client = create_bedrock_client()
+
+
+def call_bedrock(prompt):
+    """AWS Bedrock Claude Haiku 호출. JSON 문자열 반환."""
+    if not bedrock_client:
+        raise RuntimeError("bedrock_client가 None입니다. IAM 권한을 확인하세요.")
+
+    body = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 3000,
+        "temperature": 0,
+        "messages": [{"role": "user", "content": prompt}]
+    }
+
+    response = bedrock_client.invoke_model(
+        modelId=BEDROCK_MODEL_ID,
+        body=json.dumps(body)
+    )
+    result = json.loads(response["body"].read())
+    return result["content"][0]["text"]
+
+
+def extract_json(text):
+    """AI 응답 텍스트에서 JSON 객체를 추출한다."""
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    # 코드블록 안에 있는 경우 처리
+    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except Exception:
+            pass
+    # 중괄호 범위로 추출
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group())
+        except Exception:
+            pass
+    return None
 
 
 def write_progress(progress_file, status, percent, message, current=0, total=0):
@@ -228,102 +266,62 @@ def extract_text_sections(file_path):
 
 def parse_and_analyze_with_ai(notice_text, corp_name, full_text_fallback=""):
     """
-    소집공고 섹션 텍스트를 AI에게 넘겨 아래 내용을 한번에 추출·분석한다:
-    - 주총일 (D열)
-    - 안건 제목 목록 (E열) — 하위안건 합치기 규칙 포함
-    - 주주제안여부/제안자 (G/H열)
-    - 안건분류1/2 (I/J열)
-
-    반환: {
-        meeting_date: str,
-        agenda_items: [...],
-        error: str  # 실패 시 원인
-    }
+    AWS Bedrock Claude Haiku를 사용해 소집공고 텍스트를 파싱·분석한다.
+    반환: {meeting_date, agenda_items, error}
     """
-    if not openai_client:
+    if not bedrock_client:
         return {"meeting_date": "", "agenda_items": [],
-                "error": "openai_client_none:OPENAI_API_KEY 환경변수 미설정"}
+                "error": "bedrock_client_none: IAM 권한 또는 리전 설정 확인 필요"}
 
     # notice_text가 너무 짧으면 full_text 앞부분으로 fallback
     text_to_use = notice_text
     if len(notice_text.strip()) < 300 and full_text_fallback:
         text_to_use = full_text_fallback[:8000]
 
-    # 토큰 절약을 위해 7000자로 제한
     text_excerpt = text_to_use[:7000]
 
     prompt = f"""다음은 "{corp_name}"의 주주총회소집공고 문서 내용입니다.
 
 {text_excerpt}
 
-아래 정보를 JSON으로 추출·분석하세요.
+아래 정보를 JSON으로 추출·분석하세요. 반드시 JSON만 반환하고 다른 텍스트는 포함하지 마세요.
 
-1. meeting_date
-   주주총회 일시. 예: "2026년 3월 28일(금) 오전 9시"
-   없으면 빈 문자열.
+1. meeting_date: 주주총회 일시. 예: "2026년 3월 28일(금) 오전 9시". 없으면 빈 문자열.
 
-2. agenda_items
-   결의사항의 안건 목록. 아래 규칙을 엄수하세요.
+2. agenda_items: 결의사항의 안건 목록.
 
    [안건 추출 규칙]
    - 결의사항에 있는 안건만 추출 (보고사항 제외)
    - 재무제표 승인 안건도 포함
    - 하위 안건(제N-1호, 제N-2호 등)이 있는 경우:
-       * 상위 안건 제목 + 첫 번째 하위 안건 제목 → 하나의 항목으로 합침 (줄바꿈으로 연결)
+       * 상위 안건 제목 + 첫 번째 하위 안건 제목 → 하나의 항목 (줄바꿈으로 연결)
        * 두 번째 하위 안건부터 → 각각 별도 항목
-   - 원문 표현을 최대한 그대로 유지할 것
+   - 원문 표현을 최대한 그대로 유지
 
    [각 항목 필드]
-   - num: 안건번호 문자열. 예: "1", "2", "2-1", "2-2"
-   - title: 안건 제목 (원문 그대로, 하위안건 합친 경우 줄바꿈 포함)
-   - shareholder_proposal: "Y" 또는 "N"
-     * 해당 안건 앞에 "(주주제안)" 표시가 명시된 경우만 "Y"
-     * 전체 결의사항이 주주제안인 경우 해당 안건 모두 "Y"
-   - proposer: shareholder_proposal이 "Y"이면 제안 주주명, 아니면 빈 문자열
-   - category1: 아래 중 하나로 분류
-     * "재무제표승인" — 재무제표·연결재무제표·이익잉여금처분 승인
-     * "이사감사선임" — 이사·감사·감사위원 선임·선출
-     * "정관변경" — 정관 일부 또는 전부 변경
-     * "이사감사보수" — 이사·감사 보수한도 승인, 퇴직금 지급규정
-     * "자사주보유처분계획승인" — 자기주식 취득·처분·신탁
-     * "기타" — 위에 해당 없음
-   - category2: category1이 "정관변경"인 경우만 아래 중 하나, 나머지는 빈 문자열
-     * "이사 임기 유연화"
-     * "이사 임기 연장"
-     * "이사 정원 축소"
-     * "자사주 보유"
-     * "기타 개정 상법 반영"
+   - num: 안건번호. 예: "1", "2", "2-1", "2-2"
+   - title: 안건 제목 원문 (하위안건 합친 경우 \\n으로 연결)
+   - shareholder_proposal: 해당 안건 앞에 "(주주제안)" 명시 시 "Y", 아니면 "N"
+   - proposer: shareholder_proposal이 "Y"이면 제안 주주명, 아니면 ""
+   - category1: "재무제표승인" / "이사감사선임" / "정관변경" / "이사감사보수" / "자사주보유처분계획승인" / "기타" 중 하나
+   - category2: category1이 "정관변경"일 때만 "이사 임기 유연화" / "이사 임기 연장" / "이사 정원 축소" / "자사주 보유" / "기타 개정 상법 반영" 중 하나, 나머지는 ""
 
-반환 형식 (반드시 이 JSON만):
-{{
-  "meeting_date": "2026년 3월 28일(금) 오전 9시",
-  "agenda_items": [
-    {{
-      "num": "1",
-      "title": "제1호 의안 : 재무제표 승인의 건",
-      "shareholder_proposal": "N",
-      "proposer": "",
-      "category1": "재무제표승인",
-      "category2": ""
-    }}
-  ]
-}}"""
+반환 형식:
+{{"meeting_date": "...", "agenda_items": [{{"num": "1", "title": "...", "shareholder_proposal": "N", "proposer": "", "category1": "...", "category2": ""}}]}}"""
 
     try:
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-            temperature=0,
-            max_tokens=3000
-        )
-        result = json.loads(response.choices[0].message.content)
+        raw_text = call_bedrock(prompt)
+        result = extract_json(raw_text)
+        if result is None:
+            return {"meeting_date": "", "agenda_items": [],
+                    "error": f"json_parse_fail: {raw_text[:200]}"}
         result.setdefault("error", "")
         return result
     except Exception as e:
         err_msg = str(e)
-        print(f"AI 파싱/분석 오류 ({corp_name}): {err_msg}")
-        return {"meeting_date": "", "agenda_items": [], "error": f"openai_exception:{err_msg[:200]}"}
+        print(f"Bedrock 호출 오류 ({corp_name}): {err_msg}")
+        return {"meeting_date": "", "agenda_items": [],
+                "error": f"bedrock_exception:{err_msg[:200]}"}
 
 
 # ─────────────────────────────────────────────
