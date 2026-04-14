@@ -20,10 +20,12 @@ API_KEY = os.getenv("DART_API_KEY")
 jobs = {}
 
 COMPANY_CACHE_FILE = "company_names.json"
+LOCAL_CORP_XML = "corp_data/CORPCODE.xml"
 
 company_cache = {
     "loaded_at": 0,
-    "names": []
+    "names": [],
+    "source": None   # "memory" | "file" | "local_xml" | "dart"
 }
 
 
@@ -54,11 +56,34 @@ def save_company_names_to_file(names):
 def load_company_names_from_file():
     if not os.path.exists(COMPANY_CACHE_FILE):
         return []
-
     try:
         with open(COMPANY_CACHE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
+        return []
+
+
+def load_company_names_from_local_xml():
+    """
+    레포에 포함된 corp_data/CORPCODE.xml을 파싱해 회사명 목록을 반환한다.
+    DART API 호출 없이 즉시 로드 가능해 서버 시작 속도를 크게 개선한다.
+    """
+    if not os.path.exists(LOCAL_CORP_XML):
+        return []
+    try:
+        tree = ET.parse(LOCAL_CORP_XML)
+        root = tree.getroot()
+        names = set()
+        for item in root.findall("list"):
+            corp_name = item.findtext("corp_name", default="").strip()
+            stock_code = item.findtext("stock_code", default="").strip()
+            if corp_name and stock_code:
+                names.add(corp_name)
+        result = sorted(names)
+        print(f"로컬 XML에서 회사명 {len(result)}개 로드 완료")
+        return result
+    except Exception as e:
+        print(f"로컬 XML 파싱 실패: {e}")
         return []
 
 
@@ -91,16 +116,29 @@ def ensure_company_cache_loaded():
     if company_cache["names"]:
         return company_cache["names"]
 
+    # 1순위: company_names.json 파일 (이전 실행에서 저장된 최신 목록)
     file_names = load_company_names_from_file()
     if file_names:
         company_cache["names"] = file_names
         company_cache["loaded_at"] = time.time()
+        company_cache["source"] = "file"
         return file_names
 
+    # 2순위: 레포에 포함된 로컬 CORPCODE.xml (DART API 불필요, 빠름)
+    xml_names = load_company_names_from_local_xml()
+    if xml_names:
+        company_cache["names"] = xml_names
+        company_cache["loaded_at"] = time.time()
+        company_cache["source"] = "local_xml"
+        save_company_names_to_file(xml_names)
+        return xml_names
+
+    # 3순위: DART API 직접 호출 (느림, 최후 수단)
     try:
         names = fetch_company_names_from_dart()
         company_cache["names"] = names
         company_cache["loaded_at"] = time.time()
+        company_cache["source"] = "dart"
         save_company_names_to_file(names)
         return names
     except Exception as e:
@@ -109,11 +147,16 @@ def ensure_company_cache_loaded():
 
 
 def refresh_company_cache_in_background():
+    """
+    DART API에서 최신 회사 목록을 받아 캐시를 갱신한다.
+    로컬 XML이나 파일로 로드된 경우 백그라운드에서 최신화한다.
+    """
     try:
         names = fetch_company_names_from_dart()
         if names:
             company_cache["names"] = names
             company_cache["loaded_at"] = time.time()
+            company_cache["source"] = "dart"
             save_company_names_to_file(names)
             print(f"회사명 캐시 갱신 완료: {len(names)}개")
     except Exception as e:
@@ -123,8 +166,11 @@ def refresh_company_cache_in_background():
 @app.on_event("startup")
 def startup_event():
     ensure_company_cache_loaded()
-    t = threading.Thread(target=refresh_company_cache_in_background, daemon=True)
-    t.start()
+    # DART API에서 방금 받은 경우엔 바로 갱신 불필요
+    # 로컬 XML 또는 파일에서 로드된 경우만 백그라운드에서 최신화
+    if company_cache.get("source") in ("file", "local_xml"):
+        t = threading.Thread(target=refresh_company_cache_in_background, daemon=True)
+        t.start()
 
 
 class DownloadRequest(BaseModel):
