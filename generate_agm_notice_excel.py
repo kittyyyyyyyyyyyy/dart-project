@@ -19,7 +19,7 @@ load_dotenv()
 
 API_KEY = os.getenv("DART_API_KEY")
 AWS_REGION = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
-BEDROCK_MODEL_ID = "amazon.nova-lite-v1:0"
+BEDROCK_MODEL_ID = "anthropic.claude-3-haiku-20240307-v1:0"
 
 if not API_KEY:
     raise ValueError("DART_API_KEY가 없습니다. .env 또는 환경 변수를 확인하세요.")
@@ -53,16 +53,15 @@ bedrock_client = create_bedrock_client()
 
 
 def call_bedrock(prompt):
-    """AWS Bedrock Amazon Nova Lite 호출. JSON 문자열 반환."""
+    """AWS Bedrock Claude 3 Haiku 호출. JSON 문자열 반환."""
     if not bedrock_client:
         raise RuntimeError("bedrock_client가 None입니다. IAM 권한을 확인하세요.")
 
     body = {
-        "messages": [{"role": "user", "content": [{"text": prompt}]}],
-        "inferenceConfig": {
-            "max_new_tokens": 3000,
-            "temperature": 0
-        }
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 8192,
+        "temperature": 0,
+        "messages": [{"role": "user", "content": prompt}]
     }
 
     response = bedrock_client.invoke_model(
@@ -70,7 +69,7 @@ def call_bedrock(prompt):
         body=json.dumps(body)
     )
     result = json.loads(response["body"].read())
-    return result["output"]["message"]["content"][0]["text"]
+    return result["content"][0]["text"]
 
 
 def extract_json(text):
