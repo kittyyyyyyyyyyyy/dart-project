@@ -158,6 +158,53 @@
   </div>
 
   <div class="section">
+    <h2>정기주주총회 소집공고</h2>
+
+    <div class="field">
+      <label>시작일</label><br>
+      <input type="date" id="anStartDate">
+    </div>
+
+    <div class="field">
+      <label>종료일</label><br>
+      <input type="date" id="anEndDate">
+    </div>
+
+    <div class="field">
+      <label>회사 선택 방식</label><br>
+      <select id="anCompanyMode" onchange="toggleCompanyMode('an')">
+        <option value="all" selected>전부</option>
+        <option value="select">선택</option>
+      </select>
+    </div>
+
+    <div id="anCompanySelectArea" class="field hidden">
+      <label>회사명 선택</label>
+      <div class="hint">검색 후 추천 목록에서 선택하고, + 버튼으로 여러 회사를 추가하세요.</div>
+      <div id="anSuggestionStatus" class="hint"></div>
+
+      <div class="row" style="margin-top: 8px;">
+        <input type="text" id="anCompanySearch" placeholder="회사명을 입력하세요">
+        <button type="button" onclick="addSelectedCompany('an')">+</button>
+      </div>
+
+      <div id="anSuggestions" class="suggestions"></div>
+      <div id="anSelectedCompanies" class="chips"></div>
+    </div>
+
+    <button onclick="startDownload('an')">엑셀 다운로드</button>
+
+    <div class="progress-wrap" id="anProgressWrap">
+      <div class="progress-bar-bg">
+        <div class="progress-bar-fill" id="anProgressFill"></div>
+      </div>
+      <div class="progress-text" id="anProgressText">대기 중...</div>
+    </div>
+
+    <div class="error-box" id="anErrorBox"></div>
+  </div>
+
+  <div class="section">
     <h2>2026~ 정기주주총회 결과 및 찬반률(정기주주총회결과)</h2>
 
     <div class="field">
@@ -207,7 +254,8 @@
   <script>
     const state = {
       cg: { selectedCompanies: [], selectedSuggestion: null, pollTimer: null, suggestionTimer: null },
-      rm: { selectedCompanies: [], selectedSuggestion: null, pollTimer: null, suggestionTimer: null }
+      rm: { selectedCompanies: [], selectedSuggestion: null, pollTimer: null, suggestionTimer: null },
+      an: { selectedCompanies: [], selectedSuggestion: null, pollTimer: null, suggestionTimer: null }
     };
 
     function setDateRanges() {
@@ -218,6 +266,8 @@
       document.getElementById("rmEndDate").min = "2026-01-01";
       document.getElementById("rmStartDate").max = today;
       document.getElementById("rmEndDate").max = today;
+      document.getElementById("anStartDate").max = today;
+      document.getElementById("anEndDate").max = today;
     }
 
     function toggleCompanyMode(prefix) {
@@ -404,6 +454,7 @@
 
       let apiUrl = "/start-download";
       if (prefix === "rm") apiUrl = "/start-regular-download";
+      if (prefix === "an") apiUrl = "/start-agm-notice-download";
 
       try {
         const res = await fetch(apiUrl, {
@@ -477,6 +528,7 @@
       setDateRanges();
       attachSearchListener("cg");
       attachSearchListener("rm");
+      attachSearchListener("an");
     }
 
     init();
