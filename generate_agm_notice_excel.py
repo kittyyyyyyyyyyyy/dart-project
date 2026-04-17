@@ -20,6 +20,7 @@ load_dotenv()
 API_KEY = os.getenv("DART_API_KEY")
 AWS_REGION = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
 BEDROCK_MODEL_ID = "anthropic.claude-3-haiku-20240307-v1:0"
+BEDROCK_MODEL_ID_HAIKU35 = "anthropic.claude-3-5-haiku-20241022-v1:0"
 
 if not API_KEY:
     raise ValueError("DART_API_KEY가 없습니다. .env 또는 환경 변수를 확인하세요.")
@@ -55,8 +56,10 @@ def create_bedrock_client():
 bedrock_client = create_bedrock_client()
 
 
-def call_bedrock(prompt, max_tokens=4096):
-    """AWS Bedrock Claude 3 Haiku 호출. JSON 문자열 반환."""
+def call_bedrock(prompt, max_tokens=4096, model_id=None):
+    """AWS Bedrock Claude 호출. JSON 문자열 반환.
+    model_id 미지정 시 기본 모델(Haiku 3) 사용.
+    """
     if not bedrock_client:
         raise RuntimeError("bedrock_client가 None입니다. IAM 권한을 확인하세요.")
 
@@ -68,7 +71,7 @@ def call_bedrock(prompt, max_tokens=4096):
     }
 
     response = bedrock_client.invoke_model(
-        modelId=BEDROCK_MODEL_ID,
+        modelId=model_id or BEDROCK_MODEL_ID,
         body=json.dumps(body)
     )
     result = json.loads(response["body"].read())
@@ -1375,7 +1378,8 @@ def classify_charter_category(before_text, after_text, purpose_text, agenda_titl
 
     try:
         # 출력은 {"category2": "..."} 수준이므로 max_tokens=100으로 충분
-        raw_text = call_bedrock(prompt, max_tokens=100)
+        # 복잡한 규칙 준수가 필요하므로 Haiku 3.5 사용 (Haiku 3보다 지시 따르기 우수)
+        raw_text = call_bedrock(prompt, max_tokens=100, model_id=BEDROCK_MODEL_ID_HAIKU35)
         result = extract_json(raw_text)
         if not result:
             return "기타"
