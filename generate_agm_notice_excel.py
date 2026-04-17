@@ -515,6 +515,235 @@ def get_agenda_content(content_map, agenda_num, agenda_title):
 
 
 # ─────────────────────────────────────────────
+# 5-A. 이사 선임 후보자 정보 추출 (HTML 테이블 파싱)
+# ─────────────────────────────────────────────
+
+def normalize_separate_election(text):
+    """감사위원회 위원인 이사 분리선출 여부 → Y / N"""
+    t = re.sub(r'[\s\u3000\xa0]+', '', str(text))
+    if not t or t in ['-', '—', '─', '–', '×']:
+        return 'N'
+    negative_kws = ['아님', '미해당', '분리선출아님', '해당없음', '비해당', '해당사항없음', '×']
+    positive_kws = ['해당', '분리선출', '○', '예', 'Y']
+    for kw in negative_kws:
+        if kw in t:
+            return 'N'
+    for kw in positive_kws:
+        if kw in t:
+            return 'Y'
+    return text.strip()
+
+
+def extract_director_candidates_from_html(file_path):
+    """
+    HTML에서 이사 선임 후보자 정보 테이블을 파싱한다.
+    반환: {후보자성명(공백제거): {"성명": ..., "사외이사여부": ..., "분리선출여부": ..., "주된직업": ...}}
+    """
+    try:
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+        soup = BeautifulSoup(content, 'lxml')
+    except Exception:
+        return {}
+
+    candidates = {}
+
+    for table in soup.find_all('table'):
+        rows = table.find_all('tr')
+        if len(rows) < 2:
+            continue
+
+        # 헤더 찾기 (1~2번째 행에서 시도)
+        for hdr_row_idx in range(min(2, len(rows))):
+            hdr_cells = rows[hdr_row_idx].find_all(['th', 'td'])
+            headers_clean = [re.sub(r'[\s\u3000\xa0(（）)\-]+', '', c.get_text()) for c in hdr_cells]
+
+            if not any('후보자성명' in h for h in headers_clean):
+                continue
+
+            # 열 인덱스 결정
+            name_idx = outside_idx = separate_idx = occupation_idx = -1
+            for i, h in enumerate(headers_clean):
+                if '후보자성명' in h:
+                    name_idx = i
+                if '사외이사후보자여부' in h or ('사외이사' in h and '여부' in h and i != name_idx):
+                    outside_idx = i
+                if '분리선출' in h:
+                    separate_idx = i
+                if '주된직업' in h:
+                    occupation_idx = i
+
+            if name_idx == -1:
+                continue
+
+            # 데이터 행 파싱
+            for row in rows[hdr_row_idx + 1:]:
+                cells = row.find_all(['td', 'th'])
+                if not cells or len(cells) <= name_idx:
+                    continue
+                name_raw = cells[name_idx].get_text(strip=True)
+                name_key = re.sub(r'\s+', '', name_raw)
+                if not name_key or len(name_key) < 2:
+                    continue
+                if '후보자성명' in name_key or '성명' == name_key:
+                    continue  # 헤더 재등장 건너뜀
+
+                outside_val = cells[outside_idx].get_text(strip=True) if outside_idx >= 0 and outside_idx < len(cells) else ""
+                sep_raw = cells[separate_idx].get_text(strip=True) if separate_idx >= 0 and separate_idx < len(cells) else ""
+                sep_val = normalize_separate_election(sep_raw)
+                occ_val = cells[occupation_idx].get_text(strip=True) if occupation_idx >= 0 and occupation_idx < len(cells) else ""
+
+                candidates[name_key] = {
+                    "성명": name_raw,
+                    "사외이사여부": outside_val,
+                    "분리선출여부": sep_val,
+                    "주된직업": occ_val,
+                }
+            break  # 헤더 찾으면 다음 행 시도 불필요
+
+    return candidates
+
+
+def find_candidate_info(candidates_map, agenda_title):
+    """
+    안건 제목에서 후보자명을 추출하여 candidates_map에서 매칭한다.
+    반환: (성명, 사외이사여부, 분리선출여부, 주된직업)
+    """
+    empty = ("", "", "", "")
+    if not candidates_map:
+        return empty
+
+    title_no_sp = re.sub(r'\s+', '', agenda_title)
+
+    # 1) 제목에서 이름 패턴 추출
+    name_pats = [
+        r'후보자[:：]([가-힣]{2,5})',
+        r'[（(]([가-힣]{2,5})[）)]',
+        r'([가-힣]{2,5})후보',
+    ]
+    for pat in name_pats:
+        m = re.search(pat, title_no_sp)
+        if m:
+            extracted = m.group(1)
+            if extracted in candidates_map:
+                v = candidates_map[extracted]
+                return v["성명"], v["사외이사여부"], v["분리선출여부"], v["주된직업"]
+            for k, v in candidates_map.items():
+                if extracted in k or k in extracted:
+                    return v["성명"], v["사외이사여부"], v["분리선출여부"], v["주된직업"]
+
+    # 2) candidates 키를 제목에서 직접 탐색
+    for name_key, v in candidates_map.items():
+        if name_key in title_no_sp:
+            return v["성명"], v["사외이사여부"], v["분리선출여부"], v["주된직업"]
+
+    # 3) 단일 후보자면 그냥 사용
+    if len(candidates_map) == 1:
+        v = list(candidates_map.values())[0]
+        return v["성명"], v["사외이사여부"], v["분리선출여부"], v["주된직업"]
+
+    return empty
+
+
+# ─────────────────────────────────────────────
+# 5-B. 이사보수한도 정보 추출 (텍스트 파싱)
+# ─────────────────────────────────────────────
+
+def normalize_amount_to_억원(text):
+    """금액 텍스트 → 억원 단위 문자열. 예: '11,200백만원' → '112억원'"""
+    t = re.sub(r'[\s,]', '', str(text))
+    m = re.match(r'(\d+(?:\.\d+)?)억원?$', t)
+    if m:
+        return m.group(1) + '억원'
+    m = re.match(r'(\d+(?:\.\d+)?)백만원?$', t)
+    if m:
+        val = float(m.group(1)) / 100
+        s = str(int(val)) if val == int(val) else f"{val:.1f}"
+        return s + '억원'
+    m = re.match(r'(\d+)원?$', t)
+    if m:
+        val = int(m.group(1)) / 100_000_000
+        s = str(int(val)) if val == int(val) else f"{val:.2f}"
+        return s + '억원'
+    return text.strip()
+
+
+def extract_remuneration_info(text):
+    """
+    보수한도 섹션 텍스트에서 당기/전기 이사수·사외이사수·금액을 추출한다.
+    """
+    empty = {
+        "당기_이사수": "", "당기_사외이사수": "", "당기_보수총액또는최고한도액": "",
+        "전기_이사수": "", "전기_사외이사수": "", "전기_실제지급보수총액": "", "전기_최고한도액": "",
+    }
+    if not text:
+        return empty
+
+    당기_m = re.search(r'당\s*기', text)
+    전기_m = re.search(r'전\s*기', text)
+    if not 당기_m:
+        return empty
+
+    당기_start = 당기_m.start()
+    전기_start = 전기_m.start() if 전기_m else len(text)
+    당기_text = text[당기_start:전기_start]
+    전기_text = text[전기_start: min(전기_start + 3000, len(text))] if 전기_m else ""
+
+    def parse_counts(section):
+        """이사수(사외이사수) 패턴 예: '7( 4 )' """
+        m = re.search(r'(\d{1,3})\s*[（(]\s*(\d{1,3})\s*[）)]', section)
+        return (m.group(1), m.group(2)) if m else ("", "")
+
+    def find_amounts(section):
+        """억원 우선 → 백만원 → 원 순으로 금액 리스트 반환"""
+        amts = []
+        for m in re.finditer(r'(\d[\d,]*(?:\.\d+)?)\s*억\s*원', section):
+            amts.append(m.group(1).replace(',', '') + '억원')
+        if amts:
+            return amts
+        for m in re.finditer(r'(\d[\d,]*)\s*백만\s*원', section):
+            amts.append(normalize_amount_to_억원(m.group(1) + '백만원'))
+        if amts:
+            return amts
+        for m in re.finditer(r'(\d[\d,]{7,})\s*원', section):
+            amts.append(normalize_amount_to_억원(m.group(1).replace(',', '') + '원'))
+        return amts
+
+    result = dict(empty)
+
+    # 당기
+    t1, t2 = parse_counts(당기_text)
+    result["당기_이사수"] = t1
+    result["당기_사외이사수"] = t2
+    amts = find_amounts(당기_text)
+    if amts:
+        result["당기_보수총액또는최고한도액"] = amts[0]
+
+    # 전기
+    if 전기_text:
+        t1, t2 = parse_counts(전기_text)
+        result["전기_이사수"] = t1
+        result["전기_사외이사수"] = t2
+
+        실제_m = re.search(r'실제\s*지급[^\d억원]*?([\d,]+억원|[\d,]+백만원|[\d,]{7,}원)', 전기_text)
+        한도_m = re.search(r'최고\s*한도[^\d억원]*?([\d,]+억원|[\d,]+백만원|[\d,]{7,}원)', 전기_text)
+
+        if 실제_m:
+            result["전기_실제지급보수총액"] = normalize_amount_to_억원(실제_m.group(1))
+        if 한도_m:
+            result["전기_최고한도액"] = normalize_amount_to_억원(한도_m.group(1))
+
+        if not result["전기_실제지급보수총액"] or not result["전기_최고한도액"]:
+            amts = find_amounts(전기_text)
+            if not result["전기_실제지급보수총액"] and amts:
+                result["전기_실제지급보수총액"] = amts[0]
+            if not result["전기_최고한도액"] and len(amts) > 1:
+                result["전기_최고한도액"] = amts[1]
+
+    return result
+
+
+# ─────────────────────────────────────────────
 # 5. 정관변경 표 직접 파싱 (HTML → 열별 추출)
 # ─────────────────────────────────────────────
 
@@ -1059,8 +1288,13 @@ def main():
     if total_reports == 0:
         columns = ["회사명", "시장분류", "공고일", "주총일", "안건번호", "안건 제목",
                    "주주제안여부", "주주제안자", "안건분류1", "안건분류2",
-                   "[정관] 구분", "[정관] 변경전 내용", "[정관] 변경후 내용",
-                   "[정관] 변경의 목적"]
+                   "[정관] 구분", "[정관] 변경전 내용", "[정관] 변경후 내용", "[정관] 변경의 목적",
+                   "[선임] 후보자성명", "[선임] 사외이사 후보자여부",
+                   "[선임] 감사위원회 위원인 이사 분리선출 여부", "[선임] 주된직업",
+                   "[당기보수] 이사수", "[당기보수] 사외이사수", "[당기보수] 보수총액 또는 최고한도액",
+                   "[전기보수] 이사수", "[전기보수] 사외이사수",
+                   "[전기보수] 실제 지급된 보수총액", "[전기보수] 최고한도액",
+                   "[자사주승인]"]
         result_df = pd.DataFrame(columns=columns)
         fail_df = pd.DataFrame(fail_list, columns=["corp_name", "stock_code", "rcept_no", "reason"])
         with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
@@ -1147,6 +1381,10 @@ def main():
             has_charter = any(str(i.get("category1", "")) == "정관변경" for i in agenda_items)
             charter_tables_by_num = extract_charter_tables_from_html(main_file) if has_charter else {}
 
+            # 이사감사선임 안건이 있으면 후보자 테이블 미리 파싱 (루프 밖에서 1회)
+            has_선임 = any(str(i.get("category1", "")) == "이사감사선임" for i in agenda_items)
+            candidates_map = extract_director_candidates_from_html(main_file) if has_선임 else {}
+
             for item in agenda_items:
                 agenda_num = str(item.get("num", ""))
                 agenda_title = str(item.get("title", ""))
@@ -1202,6 +1440,35 @@ def main():
                     else:
                         category2 = ""
 
+                # ── 이사감사선임 안건: [선임] 정보 추출 ──
+                선임_성명 = 선임_사외이사여부 = 선임_분리선출여부 = 선임_주된직업 = ""
+                if category1 == "이사감사선임":
+                    선임_성명, 선임_사외이사여부, 선임_분리선출여부, 선임_주된직업 = find_candidate_info(
+                        candidates_map, agenda_title
+                    )
+
+                # ── 이사감사보수 안건: [보수] 정보 추출 ──
+                당기_이사수 = 당기_사외이사수 = 당기_보수총액 = ""
+                전기_이사수 = 전기_사외이사수 = 전기_실제지급 = 전기_최고한도 = ""
+                if category1 == "이사감사보수":
+                    # content_map에서 해당 안건 내용 우선 사용, 없으면 section2_text 전체 사용
+                    remu_text = get_agenda_content(content_map, agenda_num, agenda_title)
+                    if not remu_text or len(remu_text.strip()) < 50:
+                        remu_text = section2_text
+                    remu = extract_remuneration_info(remu_text)
+                    당기_이사수 = remu["당기_이사수"]
+                    당기_사외이사수 = remu["당기_사외이사수"]
+                    당기_보수총액 = remu["당기_보수총액또는최고한도액"]
+                    전기_이사수 = remu["전기_이사수"]
+                    전기_사외이사수 = remu["전기_사외이사수"]
+                    전기_실제지급 = remu["전기_실제지급보수총액"]
+                    전기_최고한도 = remu["전기_최고한도액"]
+
+                # ── 자사주보유처분계획승인 안건: 관련 내용 전부 추출 ──
+                자사주승인_내용 = ""
+                if category1 == "자사주보유처분계획승인":
+                    자사주승인_내용 = get_agenda_content(content_map, agenda_num, agenda_title)
+
                 all_rows.append({
                     "회사명": corp_name,
                     "시장분류": market_label,
@@ -1217,6 +1484,18 @@ def main():
                     "[정관] 변경전 내용": before_content,
                     "[정관] 변경후 내용": after_content,
                     "[정관] 변경의 목적": purpose,
+                    "[선임] 후보자성명": 선임_성명,
+                    "[선임] 사외이사 후보자여부": 선임_사외이사여부,
+                    "[선임] 감사위원회 위원인 이사 분리선출 여부": 선임_분리선출여부,
+                    "[선임] 주된직업": 선임_주된직업,
+                    "[당기보수] 이사수": 당기_이사수,
+                    "[당기보수] 사외이사수": 당기_사외이사수,
+                    "[당기보수] 보수총액 또는 최고한도액": 당기_보수총액,
+                    "[전기보수] 이사수": 전기_이사수,
+                    "[전기보수] 사외이사수": 전기_사외이사수,
+                    "[전기보수] 실제 지급된 보수총액": 전기_실제지급,
+                    "[전기보수] 최고한도액": 전기_최고한도,
+                    "[자사주승인]": 자사주승인_내용,
                     "_charter_key": num_clean if category1 == "정관변경" else "",
                 })
 
