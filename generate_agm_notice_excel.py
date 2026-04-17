@@ -303,9 +303,10 @@ def parse_and_analyze_with_ai(notice_text, corp_name, full_text_fallback=""):
     # notice_text가 너무 짧으면 full_text 앞부분으로 fallback
     text_to_use = notice_text
     if len(notice_text.strip()) < 300 and full_text_fallback:
-        text_to_use = full_text_fallback[:8000]
+        text_to_use = full_text_fallback[:15000]
 
-    text_excerpt = text_to_use[:7000]
+    # 안건 목록 전체가 포함되도록 충분히 긴 텍스트 전달 (7000 → 15000)
+    text_excerpt = text_to_use[:15000]
 
     prompt = f"""다음은 "{corp_name}"의 주주총회소집공고 문서 내용입니다.
 
@@ -318,18 +319,22 @@ def parse_and_analyze_with_ai(notice_text, corp_name, full_text_fallback=""):
 2. agenda_items: 결의사항의 안건 목록.
 
    [안건 추출 규칙]
-   - 결의사항에 있는 안건만 추출 (보고사항 제외)
+   - 결의사항(부의안건)에 있는 안건만 추출 (보고사항 제외)
    - 재무제표 승인 안건도 포함
    - 하위 안건(제N-1호, 제N-2호 등)이 있는 경우:
-       * 상위 안건(예: 제1호)은 목록에 포함하지 않음
-       * 하위 안건(예: 제1-1호, 제1-2호)만 각각 별도 항목으로 추출
+       * 상위 안건(예: 제2호, 제3호)은 목록에 포함하지 않음
+       * 하위 안건(예: 제2-1호, 제3-1호, 제3-2호)만 각각 별도 항목으로 추출
    - 하위 안건이 없는 단독 안건은 그대로 포함
    - 원문 표현을 최대한 그대로 유지
+   - ★ 중요: "가결될 경우에만 상정", "자동 폐기", "조건부" 등의 문구가 있는 안건도
+     반드시 포함하여 추출할 것 (조건 여부와 무관하게 안건 목록에 기재된 것은 모두 추출)
+   - ★ 중요: 주주제안 안건(제N호)의 하위 항목(제N-1호, 제N-2호, 제N-3호 등)도
+     일반 안건과 동일하게 각각 별도 항목으로 추출할 것
 
    [각 항목 필드]
-   - num: 안건번호. 예: "1", "2", "2-1", "2-2"
+   - num: 안건번호. 예: "1", "2", "2-1", "3-1", "3-2"
    - title: 안건 제목 원문 (하위안건 합친 경우 \\n으로 연결)
-   - shareholder_proposal: 해당 안건 앞에 "(주주제안)" 명시 시 "Y", 아니면 "N"
+   - shareholder_proposal: 해당 안건 또는 그 상위 안건 앞에 "(주주제안)" 명시 시 "Y", 아니면 "N"
    - proposer: shareholder_proposal이 "Y"이면 제안 주주명, 아니면 ""
    - category1: "재무제표승인" / "이사감사선임" / "정관변경" / "이사감사보수" / "자사주보유처분계획승인" / "기타" 중 하나
    - category2: 빈 문자열("")로 반환 (정관변경 안건의 세부 분류는 별도 처리됨)
