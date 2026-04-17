@@ -648,9 +648,20 @@ def extract_charter_tables_from_html(file_path):
             if not sections:
                 continue
 
+            def _extract_num_from_label(label, pattern=num_pattern):
+                """구분 레이블 텍스트에서 안건번호(예: '2-1', '2')를 추출한다."""
+                m = pattern.search(label)
+                if m:
+                    ns = m.group(1).replace(" ", "")
+                    base = int(re.split(r'-', ns)[0])
+                    if base <= 20:
+                        return ns
+                return None
+
             # ── 섹션 저장 ──
             if has_merged_구분 or len(sections) > 1:
-                # 복수 섹션 (한화갤러리아 패턴) → 각각 _pos_N
+                # 복수 섹션 (한화갤러리아/롯데지주 패턴)
+                # → 구분 레이블에서 안건번호 추출 가능하면 그걸 키로, 아니면 _pos_N
                 for sec in sections:
                     if (is_trivial(sec["data"].get("변경전 내용", []))
                             and is_trivial(sec["data"].get("변경후 내용", []))):
@@ -661,22 +672,40 @@ def extract_charter_tables_from_html(file_path):
                         "변경후 내용": "\n".join(sec["data"].get("변경후 내용", [])),
                         "변경의 목적": "\n".join(sec["data"].get("변경의 목적", [])),
                     }
-                    result[f"_pos_{pos_counter}"] = entry
-                    pos_counter += 1
+                    extracted = _extract_num_from_label(sec["label"])
+                    if extracted and extracted not in result:
+                        result[extracted] = entry
+                    else:
+                        result[f"_pos_{pos_counter}"] = entry
+                        pos_counter += 1
             else:
-                # 단일 섹션 (효성중공업 패턴) → 안건번호 키 또는 _pos_N
+                # 단일 섹션 (효성중공업/롯데지주 가-표 패턴)
+                # → 구분 셀 또는 역방향 스캔 번호를 키로 사용
                 sec = sections[0]
                 if (is_trivial(sec["data"].get("변경전 내용", []))
                         and is_trivial(sec["data"].get("변경후 내용", []))):
                     continue
+
+                # 단일 섹션에서 구분_idx가 있다면 실제 구분 셀 값 수집
+                구분_label_from_cell = ""
+                if has_구분_col:
+                    for lrow in logical_rows:
+                        gv = lrow.get(구분_idx, "").strip()
+                        if gv:
+                            구분_label_from_cell = gv
+                            break
+
                 entry = {
-                    "구분": division_from_heading,
+                    "구분": 구분_label_from_cell or division_from_heading,
                     "변경전 내용": "\n".join(sec["data"].get("변경전 내용", [])),
                     "변경후 내용": "\n".join(sec["data"].get("변경후 내용", [])),
                     "변경의 목적": "\n".join(sec["data"].get("변경의 목적", [])),
                 }
-                if agenda_num_for_table and agenda_num_for_table not in result:
-                    result[agenda_num_for_table] = entry
+                # 키 우선순위: ① 구분 셀에서 추출한 번호 ② 역방향 스캔 번호 ③ _pos_N
+                key = (_extract_num_from_label(구분_label_from_cell)
+                       or agenda_num_for_table)
+                if key and key not in result:
+                    result[key] = entry
                 else:
                     result[f"_pos_{pos_counter}"] = entry
                     pos_counter += 1
@@ -916,17 +945,22 @@ def main():
                     num_clean = agenda_num.replace(" ", "")
                     tbl = charter_tables_by_num.get(num_clean, {})
 
-                    # 직접 매칭 실패 시: 상위 번호(부모)로 시도
+                    # 이미 사용된 키 목록 (Fallback 1/2 공통으로 사용)
+                    used_keys = {
+                        r.get("_charter_key", "") for r in all_rows
+                        if r.get("회사명") == corp_name and r.get("공고일") == rcept_dt
+                    }
+
+                    # Fallback 1: 상위 번호(부모)로 시도 — 단, 아직 사용되지 않은 경우만
                     if not tbl and "-" in num_clean:
                         base = num_clean.split("-")[0]
-                        tbl = charter_tables_by_num.get(base, {})
+                        candidate = charter_tables_by_num.get(base, {})
+                        if candidate and base not in used_keys:
+                            tbl = candidate
+                            num_clean = base
 
-                    # 그래도 없으면: 미매핑 표 중 첫 번째 사용
+                    # Fallback 2: 미매핑 표(_pos_N 포함) 중 첫 번째 사용
                     if not tbl:
-                        used_keys = {
-                            r.get("_charter_key", "") for r in all_rows
-                            if r.get("회사명") == corp_name and r.get("공고일") == rcept_dt
-                        }
                         for k, v in charter_tables_by_num.items():
                             if k not in used_keys:
                                 tbl = v
