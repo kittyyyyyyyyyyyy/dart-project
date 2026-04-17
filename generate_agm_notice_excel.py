@@ -448,19 +448,16 @@ def extract_charter_tables_from_html(file_path):
     헤더 지원:
     - "변경전/변경후" 또는 "현행/개정안" 형태 모두 인식
 
-    섹션 분리 (사례2 대응):
-    - 표 안에 "구분" 컬럼이 있고, 그 행의 변경전/변경후가 모두 비어있는 경우
-      → 섹션 헤더 행으로 판정, 이전 섹션 저장 후 새 섹션 시작
-    - 섹션이 2개 이상 검출되면 각각 _pos_N 키로 저장
-      (하나의 큰 표가 여러 안건을 포함하는 경우 처리)
+    핵심: rowspan 처리 (한화갤러리아 패턴 대응)
+    - 구분 열이 rowspan>1 merged cell인 경우 논리적 표를 재구성
+    - row_span_tracker로 각 열의 남은 rowspan 추적
+    - 논리적 행 기준으로 구분값 변화 감지 → 섹션 분리
 
-    매핑 전략:
-    - 섹션이 1개: 표 직전 안건번호(제N호, 제N-M호) 탐색 → 번호 키 / 없으면 _pos_N
-    - 섹션이 복수: 모두 _pos_N (순서 기반 fallback으로 안건에 할당)
-
-    구분 결정:
-    - 섹션 헤더 행이 있으면 그 값 사용
-    - 없으면 표 직전 제목 텍스트 사용
+    섹션 분리:
+    - has_merged_구분=True (한화갤러리아 스타일):
+        구분값이 변할 때마다 새 섹션 시작 → 각각 _pos_N 키로 저장
+    - has_merged_구분=False (효성중공업 스타일):
+        단일 섹션 → 표 직전 안건번호 키 또는 _pos_N
 
     빈 표 필터:
     - 변경전/변경후가 모두 대시(—) 또는 "해당사항 없음"인 섹션은 제외
@@ -469,6 +466,41 @@ def extract_charter_tables_from_html(file_path):
         combined = " ".join(texts)
         stripped = re.sub(r'[-─—\s]+', '', combined)
         return len(stripped) < 5 or '해당사항없음' in combined.replace(' ', '')
+
+    def build_logical_rows(rows, header_row_idx, max_col_idx):
+        """rowspan을 반영한 논리적 행 목록을 반환."""
+        row_span_tracker = {}  # {col_idx: [remaining_count, value]}
+        logical_rows = []
+
+        for row in rows[header_row_idx + 1:]:
+            cells = row.find_all(["th", "td"])
+            if not cells:
+                continue
+            logical_row = {}
+            cell_idx = 0
+
+            for col_idx in range(max_col_idx + 1):
+                if col_idx in row_span_tracker:
+                    remaining, val = row_span_tracker[col_idx]
+                    logical_row[col_idx] = val
+                    if remaining - 1 > 0:
+                        row_span_tracker[col_idx] = [remaining - 1, val]
+                    else:
+                        del row_span_tracker[col_idx]
+                elif cell_idx < len(cells):
+                    cell = cells[cell_idx]
+                    val = cell.get_text(separator="\n", strip=True)
+                    logical_row[col_idx] = val
+                    span = int(cell.get("rowspan", 1))
+                    if span > 1:
+                        row_span_tracker[col_idx] = [span - 1, val]
+                    cell_idx += 1
+                else:
+                    logical_row[col_idx] = ""
+
+            logical_rows.append(logical_row)
+
+        return logical_rows
 
     try:
         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -498,7 +530,6 @@ def extract_charter_tables_from_html(file_path):
                              or "개정안" in joined or "개정 안" in joined)
                 if has_before and has_after:
                     for i, h in enumerate(headers):
-                        h_norm = h.replace(" ", "")
                         if ("구분" in h and "변경" not in h and "목적" not in h
                                 and "현행" not in h and "개정" not in h):
                             col_map["구분"] = i
@@ -544,57 +575,82 @@ def extract_charter_tables_from_html(file_path):
             af_idx   = col_map.get("변경후 내용", -1)
             목적_idx  = col_map.get("변경의 목적", -1)
             has_구분_col = 구분_idx >= 0
+            max_col_idx = max(구분_idx, bf_idx, af_idx, 목적_idx)
 
-            # ── 데이터 행 처리: 섹션 분리 ──
-            # 섹션 헤더 행: 구분 컬럼이 있고 구분값은 비어있지 않으나 변경전/변경후가 모두 빈 행
+            # ── 구분 열이 rowspan merged cell인지 확인 ──
+            has_merged_구분 = False
+            if has_구분_col:
+                data_rows = [r for r in rows[header_row_idx + 1:]
+                             if r.find_all(["th", "td"])]
+                if data_rows:
+                    first_cells = data_rows[0].find_all(["th", "td"])
+                    if 구분_idx < len(first_cells):
+                        span_val = int(first_cells[구분_idx].get("rowspan", 1))
+                        if span_val > 1:
+                            has_merged_구분 = True
+
+            # ── 논리적 행 빌드 (rowspan 반영) ──
+            logical_rows = build_logical_rows(rows, header_row_idx, max_col_idx)
+
+            # ── 섹션 분리 ──
             sections = []
-            current_label = division_from_heading
-            current_data  = {"변경전 내용": [], "변경후 내용": [], "변경의 목적": []}
-            found_section_headers = False
 
-            for row in rows[header_row_idx + 1:]:
-                cells = row.find_all(["th", "td"])
-                if not cells:
-                    continue
-                row_texts = [c.get_text(separator="\n", strip=True) for c in cells]
+            if has_구분_col and has_merged_구분:
+                # 한화갤러리아 스타일: 구분값 변화로 섹션 경계 감지
+                current_label = ""
+                current_data = {"변경전 내용": [], "변경후 내용": [], "변경의 목적": []}
 
-                구분_val = (row_texts[구분_idx]
-                            if has_구분_col and 구분_idx < len(row_texts) else "").strip()
-                bf_val   = (row_texts[bf_idx]
-                            if bf_idx >= 0 and bf_idx < len(row_texts) else "").strip()
-                af_val   = (row_texts[af_idx]
-                            if af_idx >= 0 and af_idx < len(row_texts) else "").strip()
+                for lrow in logical_rows:
+                    구분_val = lrow.get(구분_idx, "").strip()
+                    bf_val   = lrow.get(bf_idx, "").strip() if bf_idx >= 0 else ""
+                    af_val   = lrow.get(af_idx, "").strip() if af_idx >= 0 else ""
+                    목적_val  = lrow.get(목적_idx, "").strip() if 목적_idx >= 0 else ""
 
-                # 섹션 헤더 행 감지
-                if has_구분_col and 구분_val and not bf_val and not af_val:
-                    # 이전 섹션 저장 (데이터가 있으면)
-                    if any(current_data[k] for k in current_data):
-                        sections.append({"label": current_label, "data": current_data})
-                    current_label = 구분_val
-                    current_data  = {"변경전 내용": [], "변경후 내용": [], "변경의 목적": []}
-                    found_section_headers = True
-                    continue
+                    # 구분값이 바뀌면 새 섹션 시작
+                    if 구분_val and 구분_val != current_label:
+                        if any(current_data[k] for k in current_data):
+                            sections.append({"label": current_label,
+                                             "data": current_data})
+                        current_label = 구분_val
+                        current_data = {"변경전 내용": [], "변경후 내용": [],
+                                        "변경의 목적": []}
 
-                # 데이터 행 수집
-                if bf_val:
-                    current_data["변경전 내용"].append(bf_val)
-                if af_val:
-                    current_data["변경후 내용"].append(af_val)
-                if 목적_idx >= 0 and 목적_idx < len(row_texts):
-                    p_val = row_texts[목적_idx].strip()
-                    if p_val:
-                        current_data["변경의 목적"].append(p_val)
+                    if bf_val:
+                        current_data["변경전 내용"].append(bf_val)
+                    if af_val:
+                        current_data["변경후 내용"].append(af_val)
+                    if 목적_val:
+                        current_data["변경의 목적"].append(목적_val)
 
-            # 마지막 섹션 저장
-            if any(current_data[k] for k in current_data):
-                sections.append({"label": current_label, "data": current_data})
+                if any(current_data[k] for k in current_data):
+                    sections.append({"label": current_label, "data": current_data})
+
+            else:
+                # 효성중공업 스타일: rowspan 없음, 단일 섹션으로 수집
+                current_data = {"변경전 내용": [], "변경후 내용": [], "변경의 목적": []}
+
+                for lrow in logical_rows:
+                    bf_val  = lrow.get(bf_idx, "").strip() if bf_idx >= 0 else ""
+                    af_val  = lrow.get(af_idx, "").strip() if af_idx >= 0 else ""
+                    목적_val = lrow.get(목적_idx, "").strip() if 목적_idx >= 0 else ""
+
+                    if bf_val:
+                        current_data["변경전 내용"].append(bf_val)
+                    if af_val:
+                        current_data["변경후 내용"].append(af_val)
+                    if 목적_val:
+                        current_data["변경의 목적"].append(목적_val)
+
+                if any(current_data[k] for k in current_data):
+                    sections.append({"label": division_from_heading,
+                                     "data": current_data})
 
             if not sections:
                 continue
 
             # ── 섹션 저장 ──
-            if found_section_headers or len(sections) > 1:
-                # 복수 섹션 → 각각 _pos_N
+            if has_merged_구분 or len(sections) > 1:
+                # 복수 섹션 (한화갤러리아 패턴) → 각각 _pos_N
                 for sec in sections:
                     if (is_trivial(sec["data"].get("변경전 내용", []))
                             and is_trivial(sec["data"].get("변경후 내용", []))):
@@ -608,7 +664,7 @@ def extract_charter_tables_from_html(file_path):
                     result[f"_pos_{pos_counter}"] = entry
                     pos_counter += 1
             else:
-                # 단일 섹션 → 안건번호 키 또는 _pos_N
+                # 단일 섹션 (효성중공업 패턴) → 안건번호 키 또는 _pos_N
                 sec = sections[0]
                 if (is_trivial(sec["data"].get("변경전 내용", []))
                         and is_trivial(sec["data"].get("변경후 내용", []))):
@@ -629,6 +685,8 @@ def extract_charter_tables_from_html(file_path):
 
     except Exception as e:
         print(f"정관변경 표 파싱 오류: {e}")
+        import traceback
+        traceback.print_exc()
         return {}
 
 
