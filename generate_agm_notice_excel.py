@@ -55,14 +55,14 @@ def create_bedrock_client():
 bedrock_client = create_bedrock_client()
 
 
-def call_bedrock(prompt):
+def call_bedrock(prompt, max_tokens=4096):
     """AWS Bedrock Claude 3 Haiku 호출. JSON 문자열 반환."""
     if not bedrock_client:
         raise RuntimeError("bedrock_client가 None입니다. IAM 권한을 확인하세요.")
 
     body = {
         "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 8192,
+        "max_tokens": max_tokens,
         "temperature": 0,
         "messages": [{"role": "user", "content": prompt}]
     }
@@ -878,7 +878,8 @@ def classify_charter_category(before_text, after_text, purpose_text, agenda_titl
     ALLOWED = {"이사 임기 유연화", "이사 임기 연장", "이사 정원 축소", "자사주 보유", "기타"}
 
     try:
-        raw_text = call_bedrock(prompt)
+        # 출력은 {"category2": "..."} 수준이므로 max_tokens=100으로 충분
+        raw_text = call_bedrock(prompt, max_tokens=100)
         result = extract_json(raw_text)
         if not result:
             return "기타"
