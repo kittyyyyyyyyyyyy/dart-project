@@ -283,6 +283,7 @@ def extract_text_sections(file_path):
     notice_start = 0
 
     # "부의안건" 위치 탐색
+    # ★ 정정공고는 비교표 안에도 "부의안건"이 등장하므로 반드시 마지막(가장 뒤) 위치를 사용
     agenda_section_pats = [
         r'나\s*[\.．]\s*부\s*의\s*안\s*건',
         r'나\s*\.\s*부의안건',
@@ -290,15 +291,15 @@ def extract_text_sections(file_path):
     ]
     agenda_pos = -1
     for pat in agenda_section_pats:
-        m = _re.search(pat, full_text)
-        if m:
-            agenda_pos = m.start()
+        matches = list(_re.finditer(pat, full_text))
+        if matches:
+            agenda_pos = matches[-1].start()  # 마지막 위치 사용
             break
 
     if agenda_pos != -1:
         # "부의안건"보다 앞에서 가장 가까운 "주주총회 소집공고" 또는 "일 시" 등을 찾아
-        # 그 위치를 notice_start로 사용 (최대 3000자 역방향 탐색)
-        search_window = full_text[max(0, agenda_pos - 3000): agenda_pos]
+        # 그 위치를 notice_start로 사용 (최대 8000자 역방향 탐색)
+        search_window = full_text[max(0, agenda_pos - 8000): agenda_pos]
         # 역방향에서 "주주총회 소집공고" 또는 "(제N기 정기)" 등 찾기
         back_patterns = [
             r'주\s*주\s*총\s*회\s*소\s*집\s*공\s*고',
@@ -311,7 +312,7 @@ def extract_text_sections(file_path):
             for bm in _re.finditer(bp, search_window):
                 best_back = bm  # 마지막(가장 늦은) 매치를 사용
         if best_back is not None:
-            notice_start = max(0, agenda_pos - 3000) + best_back.start()
+            notice_start = max(0, agenda_pos - 8000) + best_back.start()
         else:
             # 역방향 탐색 실패 → 부의안건 500자 앞부터
             notice_start = max(0, agenda_pos - 500)
@@ -363,9 +364,11 @@ def parse_and_analyze_with_ai(notice_text, corp_name, full_text_fallback=""):
 
     # "부의안건" 위치를 찾아 그 앞 500자 + 이후 15000자를 우선 사용
     # (notice_text 앞부분에 장소·일시 설명이 길어 의안 목록이 잘리는 것을 방지)
+    # ★ 정정공고는 비교표 안에도 "부의안건"이 등장하므로 마지막(가장 뒤) 위치 사용
     import re as _re2
     agenda_section_pat = _re2.compile(r'나\s*[\.．]\s*부의안건|나\.\s*부\s*의\s*안\s*건|부의\s*안건')
-    m = agenda_section_pat.search(text_to_use)
+    all_agenda_matches = list(agenda_section_pat.finditer(text_to_use))
+    m = all_agenda_matches[-1] if all_agenda_matches else None
     if m and m.start() > 500:
         # 부의안건 섹션 500자 앞부터 15000자
         slice_start = max(0, m.start() - 500)
