@@ -443,34 +443,33 @@ def get_agenda_content(content_map, agenda_num, agenda_title):
 
 def extract_charter_tables_from_html(file_path):
     """
-    HTML 파일에서 정관변경 표(변경전/변경후/변경의 목적 열 포함)를 모두 찾아
-    각 표의 내용을 구조화된 dict 리스트로 반환한다.
-    반환: [{"구분": str, "변경전 내용": str, "변경후 내용": str, "변경의 목적": str}, ...]
+    HTML에서 정관변경 표(변경전/변경후/목적 열)를 안건번호 기준으로 파싱한다.
+    각 표 직전 텍스트에서 안건번호를 찾아 매핑한다.
+    반환: {num_clean: {"구분": str, "변경전 내용": str, "변경후 내용": str, "변경의 목적": str}}
     """
     try:
         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-            content = f.read()
-        soup = BeautifulSoup(content, "lxml")
+            html_content = f.read()
+        soup = BeautifulSoup(html_content, "lxml")
+        num_pattern = re.compile(r'제\s*(\d+(?:-\d+)?)\s*호\s*의\s*안')
+        result = {}
 
-        results = []
         for table in soup.find_all("table"):
             rows = table.find_all("tr")
             if not rows:
                 continue
 
-            # 헤더 행 탐색: 첫 몇 행에서 "변경전"과 "변경후" 모두 포함한 행 찾기
+            # 정관변경 표인지 확인 (변경전/변경후 컬럼 존재)
             header_row_idx = None
             col_map = {}
             for ri, row in enumerate(rows[:5]):
                 cells = row.find_all(["th", "td"])
                 headers = [c.get_text(separator=" ", strip=True) for c in cells]
-                header_joined = " ".join(headers)
-                if ("변경전" in header_joined or "변경 전" in header_joined) and \
-                   ("변경후" in header_joined or "변경 후" in header_joined):
+                joined = " ".join(headers)
+                if ("변경전" in joined or "변경 전" in joined) and \
+                   ("변경후" in joined or "변경 후" in joined):
                     for i, h in enumerate(headers):
-                        if "구분" in h:
-                            col_map["구분"] = i
-                        elif "변경전" in h or "변경 전" in h:
+                        if "변경전" in h or "변경 전" in h:
                             col_map["변경전 내용"] = i
                         elif "변경후" in h or "변경 후" in h:
                             col_map["변경후 내용"] = i
@@ -482,8 +481,28 @@ def extract_charter_tables_from_html(file_path):
             if header_row_idx is None or "변경전 내용" not in col_map:
                 continue
 
-            # 데이터 행에서 각 열 텍스트 수집
-            col_texts = {k: [] for k in col_map}
+            # ── 이 표 직전에서 안건번호 역방향 탐색 ──
+            # 다른 표 내부 요소는 건너뛰고, 다른 표 자체를 만나면 중단
+            agenda_num = None
+            division_text = ""
+            for prev in table.find_all_previous(True):
+                parent_table = prev.find_parent("table")
+                if parent_table:
+                    continue          # 다른 표 내부 요소 → 스킵
+                if prev.name == "table":
+                    break             # 이전 표를 만나면 탐색 중단
+                if prev.name in ["script", "style", "head"]:
+                    continue
+                text = prev.get_text(separator=" ", strip=True)
+                if text:
+                    m = num_pattern.search(text)
+                    if m:
+                        agenda_num = m.group(1).replace(" ", "")
+                        division_text = text[:500]
+                        break
+
+            # ── 데이터 행 추출 ──
+            col_texts = {"변경전 내용": [], "변경후 내용": [], "변경의 목적": []}
             for row in rows[header_row_idx + 1:]:
                 cells = row.find_all(["th", "td"])
                 if not cells:
@@ -494,22 +513,23 @@ def extract_charter_tables_from_html(file_path):
                     if val:
                         col_texts[key].append(val)
 
-            # 빈 표 스킵
             if not col_texts.get("변경전 내용") and not col_texts.get("변경후 내용"):
                 continue
 
-            results.append({
-                "구분": "\n".join(col_texts.get("구분", [])),
-                "변경전 내용": "\n".join(col_texts.get("변경전 내용", [])),
-                "변경후 내용": "\n".join(col_texts.get("변경후 내용", [])),
-                "변경의 목적": "\n".join(col_texts.get("변경의 목적", [])),
-            })
+            key = agenda_num or f"unknown_{len(result)}"
+            if key not in result:  # 같은 번호에 여러 표이면 첫 번째만
+                result[key] = {
+                    "구분": division_text,
+                    "변경전 내용": "\n".join(col_texts.get("변경전 내용", [])),
+                    "변경후 내용": "\n".join(col_texts.get("변경후 내용", [])),
+                    "변경의 목적": "\n".join(col_texts.get("변경의 목적", [])),
+                }
 
-        return results
+        return result
 
     except Exception as e:
         print(f"정관변경 표 파싱 오류: {e}")
-        return []
+        return {}
 
 
 def classify_charter_category(before_text, after_text, purpose_text, agenda_title):
@@ -700,40 +720,47 @@ def main():
             # F열용 section2 내용 맵 구성
             content_map = build_section2_content_map(section2_text)
 
+            # 정관변경 안건이 있으면 HTML에서 표를 미리 파싱 (루프 밖에서 1회)
+            has_charter = any(str(i.get("category1", "")) == "정관변경" for i in agenda_items)
+            charter_tables_by_num = extract_charter_tables_from_html(main_file) if has_charter else {}
+
             for item in agenda_items:
                 agenda_num = str(item.get("num", ""))
                 agenda_title = str(item.get("title", ""))
-                agenda_content = get_agenda_content(content_map, agenda_num, agenda_title)
                 category1 = str(item.get("category1", ""))
                 category2 = str(item.get("category2", ""))
 
-                # ── 정관변경 안건: AI 2차 호출로 상세 내용 추출 및 분류 ──
+                # ── 정관변경 안건: 안건번호로 표 매핑 ──
                 charter_division = ""
                 before_content = ""
                 after_content = ""
                 purpose = ""
 
                 if category1 == "정관변경":
-                    # HTML 표를 직접 파싱해 변경전/변경후/목적 추출
-                    charter_tables = extract_charter_tables_from_html(main_file)
+                    num_clean = agenda_num.replace(" ", "")
+                    tbl = charter_tables_by_num.get(num_clean, {})
 
-                    if charter_tables:
-                        # 정관변경 안건이 여러 개일 때: 안건번호로 대응하는 표 선택
-                        # 같은 보고서 내 정관변경 안건 순서와 표 순서가 일치한다고 가정
-                        # (동일 보고서 처리 중 몇 번째 정관변경 안건인지 추적)
-                        charter_idx = sum(
-                            1 for r in all_rows
-                            if r.get("회사명") == corp_name
-                            and r.get("공고일") == rcept_dt
-                            and r.get("안건분류1") == "정관변경"
-                        )
-                        tbl = charter_tables[min(charter_idx, len(charter_tables) - 1)]
-                        charter_division = tbl.get("구분", "")
-                        before_content = tbl.get("변경전 내용", "")
-                        after_content = tbl.get("변경후 내용", "")
-                        purpose = tbl.get("변경의 목적", "")
-                    else:
-                        charter_division = before_content = after_content = purpose = ""
+                    # 직접 매칭 실패 시: 상위 번호(부모)로 시도
+                    if not tbl and "-" in num_clean:
+                        base = num_clean.split("-")[0]
+                        tbl = charter_tables_by_num.get(base, {})
+
+                    # 그래도 없으면: 미매핑 표 중 첫 번째 사용
+                    if not tbl:
+                        used_keys = {
+                            r.get("_charter_key", "") for r in all_rows
+                            if r.get("회사명") == corp_name and r.get("공고일") == rcept_dt
+                        }
+                        for k, v in charter_tables_by_num.items():
+                            if k not in used_keys:
+                                tbl = v
+                                num_clean = k
+                                break
+
+                    charter_division = tbl.get("구분", "")
+                    before_content = tbl.get("변경전 내용", "")
+                    after_content = tbl.get("변경후 내용", "")
+                    purpose = tbl.get("변경의 목적", "")
 
                     # AI로 category2만 분류
                     category2 = classify_charter_category(
@@ -755,6 +782,7 @@ def main():
                     "[정관] 변경전 내용": before_content,
                     "[정관] 변경후 내용": after_content,
                     "[정관] 변경의 목적": purpose,
+                    "_charter_key": num_clean if category1 == "정관변경" else "",
                 })
 
         except Exception as e:
@@ -764,6 +792,10 @@ def main():
             shutil.rmtree(folder_name, ignore_errors=True)
 
         time.sleep(0.08)
+
+    # 내부 추적용 _charter_key 열 제거
+    for row in all_rows:
+        row.pop("_charter_key", None)
 
     result_df = pd.DataFrame(all_rows)
     fail_df = pd.DataFrame(fail_list, columns=["corp_name", "stock_code", "rcept_no", "reason"])
