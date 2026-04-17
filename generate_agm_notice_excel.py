@@ -27,6 +27,9 @@ if not API_KEY:
 
 def make_session():
     session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (compatible; AGMNoticeBot/1.0)"
+    })
     retry = Retry(
         total=5, connect=5, read=5, backoff_factor=1.5,
         status_forcelist=[429, 500, 502, 503, 504],
@@ -138,8 +141,20 @@ def chunk_date_ranges(start_date_str, end_date_str, chunk_days=90):
     return ranges
 
 
-def safe_get(url, params):
-    return http.get(url, params=params, timeout=(20, 120))
+def safe_get(url, params, retries=3):
+    """DART API GET 요청. ConnectTimeout 발생 시 지수 백오프로 재시도."""
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            resp = http.get(url, params=params, timeout=(60, 180))
+            resp.raise_for_status()
+            return resp
+        except requests.exceptions.RequestException as e:
+            last_err = e
+            wait = min(2 ** attempt, 30)
+            print(f"[WARN] DART 요청 실패 ({attempt}/{retries}): {e} — {wait}초 후 재시도")
+            time.sleep(wait)
+    raise last_err
 
 
 # ─────────────────────────────────────────────
