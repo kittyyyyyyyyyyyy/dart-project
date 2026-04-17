@@ -438,84 +438,126 @@ def get_agenda_content(content_map, agenda_num, agenda_title):
 
 
 # ─────────────────────────────────────────────
-# 5. 정관변경 상세 분석 (AI 2차 호출)
+# 5. 정관변경 표 직접 파싱 (HTML → 열별 추출)
 # ─────────────────────────────────────────────
 
-def analyze_charter_amendment(content_text, agenda_num, agenda_title):
+def extract_charter_tables_from_html(file_path):
     """
-    정관변경 안건의 section2 내용을 AI로 분석해
-    구분 / 변경전 / 변경후 / 변경의 목적 및 안건분류2를 반환한다.
+    HTML 파일에서 정관변경 표(변경전/변경후/변경의 목적 열 포함)를 모두 찾아
+    각 표의 내용을 구조화된 dict 리스트로 반환한다.
+    반환: [{"구분": str, "변경전 내용": str, "변경후 내용": str, "변경의 목적": str}, ...]
     """
-    empty = {"category2": "", "charter_division": "",
-             "before_content": "", "after_content": "", "purpose": ""}
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+        soup = BeautifulSoup(content, "lxml")
 
+        results = []
+        for table in soup.find_all("table"):
+            rows = table.find_all("tr")
+            if not rows:
+                continue
+
+            # 헤더 행 탐색: 첫 몇 행에서 "변경전"과 "변경후" 모두 포함한 행 찾기
+            header_row_idx = None
+            col_map = {}
+            for ri, row in enumerate(rows[:5]):
+                cells = row.find_all(["th", "td"])
+                headers = [c.get_text(separator=" ", strip=True) for c in cells]
+                header_joined = " ".join(headers)
+                if ("변경전" in header_joined or "변경 전" in header_joined) and \
+                   ("변경후" in header_joined or "변경 후" in header_joined):
+                    for i, h in enumerate(headers):
+                        if "구분" in h:
+                            col_map["구분"] = i
+                        elif "변경전" in h or "변경 전" in h:
+                            col_map["변경전 내용"] = i
+                        elif "변경후" in h or "변경 후" in h:
+                            col_map["변경후 내용"] = i
+                        elif "목적" in h:
+                            col_map["변경의 목적"] = i
+                    header_row_idx = ri
+                    break
+
+            if header_row_idx is None or "변경전 내용" not in col_map:
+                continue
+
+            # 데이터 행에서 각 열 텍스트 수집
+            col_texts = {k: [] for k in col_map}
+            for row in rows[header_row_idx + 1:]:
+                cells = row.find_all(["th", "td"])
+                if not cells:
+                    continue
+                row_texts = [c.get_text(separator="\n", strip=True) for c in cells]
+                for key, idx in col_map.items():
+                    val = row_texts[idx] if idx < len(row_texts) else ""
+                    if val:
+                        col_texts[key].append(val)
+
+            # 빈 표 스킵
+            if not col_texts.get("변경전 내용") and not col_texts.get("변경후 내용"):
+                continue
+
+            results.append({
+                "구분": "\n".join(col_texts.get("구분", [])),
+                "변경전 내용": "\n".join(col_texts.get("변경전 내용", [])),
+                "변경후 내용": "\n".join(col_texts.get("변경후 내용", [])),
+                "변경의 목적": "\n".join(col_texts.get("변경의 목적", [])),
+            })
+
+        return results
+
+    except Exception as e:
+        print(f"정관변경 표 파싱 오류: {e}")
+        return []
+
+
+def classify_charter_category(before_text, after_text, purpose_text, agenda_title):
+    """
+    변경전/변경후/변경의 목적 텍스트를 바탕으로 안건분류2를 AI로 판단한다.
+    반환: str (예: "이사 임기 유연화" 또는 "이사 정원 축소, 자사주 보유")
+    """
     if not bedrock_client:
-        return empty
+        return ""
 
-    text_excerpt = (content_text or "").strip()
-    if not text_excerpt:
-        return empty
+    combined = f"[변경전 내용]\n{before_text}\n\n[변경후 내용]\n{after_text}\n\n[변경의 목적]\n{purpose_text}"
 
-    prompt = f"""다음은 정관변경 안건(안건번호: {agenda_num}, 제목: {agenda_title})의 상세 내용입니다.
+    prompt = f"""다음은 정관변경 안건 "{agenda_title}"의 변경 내용입니다.
 
-{text_excerpt[:6000]}
+{combined[:5000]}
 
-아래 정보를 JSON으로 추출·분석하세요. 반드시 JSON만 반환하고 다른 텍스트는 포함하지 마세요.
+아래 5가지 카테고리 중 해당하는 것을 선택하세요. 반드시 아래 허용 값 중에서만 선택하고, 그 외 임의 값은 절대 사용 금지.
+허용 값: "이사 임기 유연화", "이사 임기 연장", "이사 정원 축소", "자사주 보유", "기타"
 
-1. category2: 반드시 아래 5가지 카테고리 중에서만 선택하세요. 그 외 임의의 값은 절대 사용 금지.
-   허용 값: "이사 임기 유연화", "이사 임기 연장", "이사 정원 축소", "자사주 보유", "기타"
+판단 기준:
+- "이사 임기 유연화": 이사의 임기가 고정 연수이었으나, 상한만 두고 유연하게 정할 수 있도록 개정된 경우.
+  예) "이사의 임기는 3년으로 한다" → "이사의 임기는 3년을 초과하지 못한다"
 
-   ※ "기타"를 제외하고 두 가지 이상 해당 시 쉼표로 구분해 모두 기재 (예: "이사 정원 축소, 자사주 보유")
-   ※ 위 네 가지 중 하나도 해당 없으면 반드시 "기타"
+- "이사 임기 연장": 이사의 임기 기간 수치 자체가 늘어난 경우.
+  예) "취임 후 2년 내" → "취임 후 3년 내"
 
-   판단 기준:
-   - "이사 임기 유연화": 이사의 임기가 고정 연수이었으나, 상한만 두고 유연하게 정할 수 있도록 개정된 경우.
-     예) "이사의 임기는 3년으로 한다" → "이사의 임기는 3년을 초과하지 못한다"
-     (핵심: 기존엔 특정 연수로 고정, 이후엔 '초과하지 못한다'/'이내' 형태로 상한만 설정)
+- "이사 정원 축소": 이사회 정원 상한이 신설되거나 기존 상한이 줄어든 경우.
+  예) "3명 이상 16명 이내" → "3명 이상 9인 이하"
 
-   - "이사 임기 연장": 이사의 임기 기간 수치 자체가 늘어난 경우.
-     예) "취임 후 2년 내의 최종 결산기" → "취임 후 3년 내의 최종 결산기"
-     (핵심: 연도 숫자가 증가)
+- "자사주 보유": 자기주식 보유 또는 처분에 관한 정관 신설 또는 변경.
 
-   - "이사 정원 축소": 이사회 정원의 상한이 신설되거나 기존 상한이 줄어든 경우.
-     예) "3명 이상 16명 이내" → "3명 이상 9인 이하"
-     (핵심: 상한 숫자가 감소하거나 상한이 새로 생긴 경우)
+- "기타": 위 네 분류 중 하나도 해당 없는 경우.
 
-   - "자사주 보유": 자기주식의 보유 또는 처분에 관한 정관 신설 또는 변경.
-     예) 회사가 경영상 목적 등을 위해 자기주식을 보유·처분할 수 있다는 조항 신설
+※ "기타"를 제외하고 두 가지 이상 해당 시 쉼표로 구분해 모두 기재. 예: "이사 정원 축소, 자사주 보유"
+※ 위 네 가지 중 하나도 해당 없으면 반드시 "기타"
 
-   - "기타": 위 네 분류 중 하나도 해당 없는 경우. (반드시 "기타" 그대로 작성)
-
-2. charter_division: 해당 의안의 의안번호·제목·구분·전체적 설명 등 항목의 내용 전체.
-   표가 여러 행이면 각 행을 줄바꿈(\\n)으로 연결.
-
-3. before_content: "변경전 내용" 열에 해당하는 내용 전체.
-   표가 여러 행이면 각 행을 줄바꿈(\\n)으로 연결.
-
-4. after_content: "변경후 내용" 열에 해당하는 내용 전체.
-   표가 여러 행이면 각 행을 줄바꿈(\\n)으로 연결.
-
-5. purpose: "변경의 목적" 열에 해당하는 내용 전체.
-   표가 여러 행이면 각 행을 줄바꿈(\\n)으로 연결.
-
-반환 규칙:
-- 반드시 순수 JSON만 반환할 것
-- 코드블록(```) 절대 사용 금지
-- 해당 내용이 없으면 빈 문자열("")
-
-반환 형식:
-{{"category2": "...", "charter_division": "...", "before_content": "...", "after_content": "...", "purpose": "..."}}"""
+결과를 JSON으로만 반환. 다른 텍스트 없이 JSON만.
+반환 형식: {{"category2": "..."}}"""
 
     try:
         raw_text = call_bedrock(prompt)
         result = extract_json(raw_text)
-        if result is None:
-            print(f"정관변경 분석 JSON 파싱 실패 ({agenda_num}): {raw_text[:200]}")
-            return empty
-        return result
+        if result:
+            return str(result.get("category2", "기타"))
+        return "기타"
     except Exception as e:
-        print(f"정관변경 분석 오류 ({agenda_num}): {e}")
-        return empty
+        print(f"안건분류2 분류 오류: {e}")
+        return ""
 
 
 # ─────────────────────────────────────────────
@@ -672,31 +714,31 @@ def main():
                 purpose = ""
 
                 if category1 == "정관변경":
-                    num_clean = agenda_num.replace(' ', '')
-                    # 1순위: content_map 직접 조회
-                    charter_text = content_map.get(num_clean, "")
-                    # 2순위: get_agenda_content 결과
-                    if not charter_text:
-                        charter_text = agenda_content
-                    # 3순위: section2_text에서 안건번호 주변 탐색
-                    if not charter_text and section2_text:
-                        m = re.search(r'제\s*' + re.escape(num_clean) + r'\s*호', section2_text)
-                        if m:
-                            s = max(0, m.start() - 200)
-                            charter_text = section2_text[s:s + 8000]
-                        else:
-                            charter_text = section2_text[:8000]
-                    # 4순위: full_text 중간 구간 (section2가 있을 위치)
-                    if not charter_text and full_text:
-                        charter_text = full_text[8000:16000]
-                    charter_result = analyze_charter_amendment(
-                        charter_text, agenda_num, agenda_title
+                    # HTML 표를 직접 파싱해 변경전/변경후/목적 추출
+                    charter_tables = extract_charter_tables_from_html(main_file)
+
+                    if charter_tables:
+                        # 정관변경 안건이 여러 개일 때: 안건번호로 대응하는 표 선택
+                        # 같은 보고서 내 정관변경 안건 순서와 표 순서가 일치한다고 가정
+                        # (동일 보고서 처리 중 몇 번째 정관변경 안건인지 추적)
+                        charter_idx = sum(
+                            1 for r in all_rows
+                            if r.get("회사명") == corp_name
+                            and r.get("공고일") == rcept_dt
+                            and r.get("안건분류1") == "정관변경"
+                        )
+                        tbl = charter_tables[min(charter_idx, len(charter_tables) - 1)]
+                        charter_division = tbl.get("구분", "")
+                        before_content = tbl.get("변경전 내용", "")
+                        after_content = tbl.get("변경후 내용", "")
+                        purpose = tbl.get("변경의 목적", "")
+                    else:
+                        charter_division = before_content = after_content = purpose = ""
+
+                    # AI로 category2만 분류
+                    category2 = classify_charter_category(
+                        before_content, after_content, purpose, agenda_title
                     )
-                    category2 = charter_result.get("category2", "")
-                    charter_division = charter_result.get("charter_division", "")
-                    before_content = charter_result.get("before_content", "")
-                    after_content = charter_result.get("after_content", "")
-                    purpose = charter_result.get("purpose", "")
 
                 all_rows.append({
                     "회사명": corp_name,
