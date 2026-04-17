@@ -578,7 +578,7 @@ def main():
         columns = ["회사명", "시장분류", "공고일", "주총일", "안건번호", "안건 제목",
                    "주주제안여부", "주주제안자", "안건분류1", "안건분류2",
                    "[정관] 구분", "[정관] 변경전 내용", "[정관] 변경후 내용",
-                   "[정관] 변경의 목적", "안건 내용"]
+                   "[정관] 변경의 목적"]
         result_df = pd.DataFrame(columns=columns)
         fail_df = pd.DataFrame(fail_list, columns=["corp_name", "stock_code", "rcept_no", "reason"])
         with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
@@ -673,10 +673,22 @@ def main():
 
                 if category1 == "정관변경":
                     num_clean = agenda_num.replace(' ', '')
+                    # 1순위: content_map 직접 조회
                     charter_text = content_map.get(num_clean, "")
-                    # content_map에 없으면 agenda_content(get_agenda_content 결과) 사용
+                    # 2순위: get_agenda_content 결과
                     if not charter_text:
                         charter_text = agenda_content
+                    # 3순위: section2_text에서 안건번호 주변 탐색
+                    if not charter_text and section2_text:
+                        m = re.search(r'제\s*' + re.escape(num_clean) + r'\s*호', section2_text)
+                        if m:
+                            s = max(0, m.start() - 200)
+                            charter_text = section2_text[s:s + 8000]
+                        else:
+                            charter_text = section2_text[:8000]
+                    # 4순위: full_text 중간 구간 (section2가 있을 위치)
+                    if not charter_text and full_text:
+                        charter_text = full_text[8000:16000]
                     charter_result = analyze_charter_amendment(
                         charter_text, agenda_num, agenda_title
                     )
@@ -701,7 +713,6 @@ def main():
                     "[정관] 변경전 내용": before_content,
                     "[정관] 변경후 내용": after_content,
                     "[정관] 변경의 목적": purpose,
-                    "안건 내용": agenda_content,  # 항상 맨 마지막 열
                 })
 
         except Exception as e:
