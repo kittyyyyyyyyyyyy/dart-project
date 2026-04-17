@@ -261,6 +261,10 @@ def extract_text_sections(file_path):
     - notice_text: 주주총회 소집공고 섹션 (일시, 결의사항 포함)
     - section2_text: 주주총회 목적사항별 기재사항 섹션 (안건 상세 내용)
     - full_text: 전체 텍스트 (notice_text가 짧을 경우 AI fallback용)
+
+    ※ 정정공고의 경우 "주주총회 소집공고" 키워드가 정정비교표에 먼저 등장해
+       실제 의안 목록이 아닌 비교표 텍스트를 읽는 오류를 방지하기 위해,
+       "부의안건"이 실제로 존재하는 소집공고 절을 정확히 찾는다.
     """
     with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
         content = f.read()
@@ -273,16 +277,53 @@ def extract_text_sections(file_path):
     full_text = _re.sub(r'\n{4,}', '\n\n', full_text)
     full_text = _re.sub(r'[ \t]{3,}', '  ', full_text)
 
-    # 소집공고 섹션 시작점 찾기
+    # ── 소집공고 섹션 시작점 찾기 ──
+    # 전략: "부의안건" 키워드를 직접 찾아 역방향으로 올라가 실제 소집공고 시작점을 찾는다.
+    # 이렇게 하면 정정공고 비교표에 "주주총회 소집공고"가 먼저 등장해도 영향 없음.
     notice_start = 0
-    for kw in ["주주총회 소집공고", "주주총회소집공고", "소 집 공 고",
-               "주주총 회 소집공고", "주 주 총 회 소 집 공 고"]:
-        idx = full_text.find(kw)
-        if idx != -1:
-            notice_start = idx
+
+    # "부의안건" 위치 탐색
+    agenda_section_pats = [
+        r'나\s*[\.．]\s*부\s*의\s*안\s*건',
+        r'나\s*\.\s*부의안건',
+        r'부\s*의\s*안\s*건',
+    ]
+    agenda_pos = -1
+    for pat in agenda_section_pats:
+        m = _re.search(pat, full_text)
+        if m:
+            agenda_pos = m.start()
             break
 
-    # 목적사항별 기재사항 섹션 시작점 찾기
+    if agenda_pos != -1:
+        # "부의안건"보다 앞에서 가장 가까운 "주주총회 소집공고" 또는 "일 시" 등을 찾아
+        # 그 위치를 notice_start로 사용 (최대 3000자 역방향 탐색)
+        search_window = full_text[max(0, agenda_pos - 3000): agenda_pos]
+        # 역방향에서 "주주총회 소집공고" 또는 "(제N기 정기)" 등 찾기
+        back_patterns = [
+            r'주\s*주\s*총\s*회\s*소\s*집\s*공\s*고',
+            r'소\s*집\s*공\s*고',
+            r'\(제\d+기\s*정기\)',
+            r'[1１]\s*\.\s*일\s*시',
+        ]
+        best_back = None
+        for bp in back_patterns:
+            for bm in _re.finditer(bp, search_window):
+                best_back = bm  # 마지막(가장 늦은) 매치를 사용
+        if best_back is not None:
+            notice_start = max(0, agenda_pos - 3000) + best_back.start()
+        else:
+            # 역방향 탐색 실패 → 부의안건 500자 앞부터
+            notice_start = max(0, agenda_pos - 500)
+    else:
+        # fallback: "주주총회 소집공고" 첫 번째 위치
+        for kw in ["주주총회 소집공고", "주주총회소집공고", "소 집 공 고"]:
+            idx = full_text.find(kw)
+            if idx != -1:
+                notice_start = idx
+                break
+
+    # ── 목적사항별 기재사항 섹션 시작점 찾기 ──
     section2_start = -1
     for kw in ["주주총회 목적사항별 기재사항", "주주총회목적사항별기재사항",
                "목적사항별 기재사항", "목 적 사 항 별 기 재 사 항",
@@ -318,10 +359,19 @@ def parse_and_analyze_with_ai(notice_text, corp_name, full_text_fallback=""):
     # notice_text가 너무 짧으면 full_text 앞부분으로 fallback
     text_to_use = notice_text
     if len(notice_text.strip()) < 300 and full_text_fallback:
-        text_to_use = full_text_fallback[:15000]
+        text_to_use = full_text_fallback[:20000]
 
-    # 안건 목록 전체가 포함되도록 충분히 긴 텍스트 전달 (7000 → 15000)
-    text_excerpt = text_to_use[:15000]
+    # "부의안건" 위치를 찾아 그 앞 500자 + 이후 15000자를 우선 사용
+    # (notice_text 앞부분에 장소·일시 설명이 길어 의안 목록이 잘리는 것을 방지)
+    import re as _re2
+    agenda_section_pat = _re2.compile(r'나\s*[\.．]\s*부의안건|나\.\s*부\s*의\s*안\s*건|부의\s*안건')
+    m = agenda_section_pat.search(text_to_use)
+    if m and m.start() > 500:
+        # 부의안건 섹션 500자 앞부터 15000자
+        slice_start = max(0, m.start() - 500)
+        text_excerpt = text_to_use[slice_start: slice_start + 15000]
+    else:
+        text_excerpt = text_to_use[:15000]
 
     prompt = f"""다음은 "{corp_name}"의 주주총회소집공고 문서 내용입니다.
 
