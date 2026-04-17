@@ -336,18 +336,18 @@ def parse_and_analyze_with_ai(notice_text, corp_name, full_text_fallback=""):
    [안건 추출 규칙]
    - 결의사항(부의안건)에 있는 안건만 추출 (보고사항 제외)
    - 재무제표 승인 안건도 포함
-   - 하위 안건(제N-1호, 제N-2호 등)이 있는 경우:
-       * 상위 안건(예: 제2호, 제3호)은 목록에 포함하지 않음
-       * 하위 안건(예: 제2-1호, 제3-1호, 제3-2호)만 각각 별도 항목으로 추출
-   - 하위 안건이 없는 단독 안건은 그대로 포함
+   - 안건에 하위 안건이 있는 경우, 반드시 최하위 안건만 추출:
+       * 2단계: 제2호 아래 제2-1호, 제2-2호가 있으면 → 제2-1호, 제2-2호만 추출 (제2호 제외)
+       * 3단계: 제2-1호 아래 제2-1-1호, 제2-1-2호가 있으면 → 제2-1-1호, 제2-1-2호만 추출 (제2호, 제2-1호 모두 제외)
+       * 즉, 하위 안건이 있는 상위 안건은 절대 포함하지 않음
+   - 하위 안건이 없는 단독 안건(제1호, 제4호 등)은 그대로 포함
    - 원문 표현을 최대한 그대로 유지
    - ★ 중요: "가결될 경우에만 상정", "자동 폐기", "조건부" 등의 문구가 있는 안건도
      반드시 포함하여 추출할 것 (조건 여부와 무관하게 안건 목록에 기재된 것은 모두 추출)
-   - ★ 중요: 주주제안 안건(제N호)의 하위 항목(제N-1호, 제N-2호, 제N-3호 등)도
-     일반 안건과 동일하게 각각 별도 항목으로 추출할 것
+   - ★ 중요: 주주제안 안건의 하위 항목도 일반 안건과 동일하게 각각 별도 항목으로 추출할 것
 
    [각 항목 필드]
-   - num: 안건번호. 예: "1", "2", "2-1", "3-1", "3-2"
+   - num: 안건번호 (숫자만, 하이픈으로 연결). 예: "1", "2-1", "2-1-1", "2-1-2", "3-1", "6-1"
    - title: 안건 제목 원문 (하위안건 합친 경우 \\n으로 연결)
    - shareholder_proposal: 해당 안건 또는 그 상위 안건 앞에 "(주주제안)" 명시 시 "Y", 아니면 "N"
    - proposer: shareholder_proposal이 "Y"이면 제안 주주명, 아니면 ""
@@ -392,7 +392,7 @@ def build_section2_content_map(section2_text):
     import re
     # 섹션 헤더 패턴: □ 제N호, ■ 제N호, ㅁ 제N호 의안 등
     header_pattern = re.compile(
-        r'(?:□|■|ㅁ|▣|◆|◇|▶|●|○)?\s*제\s*(\d+(?:-\d+)?)\s*호(?:\s*의\s*안)?',
+        r'(?:□|■|ㅁ|▣|◆|◇|▶|●|○)?\s*제\s*(\d+(?:-\d+)*)\s*호(?:\s*의\s*안)?',
         re.MULTILINE
     )
     headers = [(m.group(1).replace(' ', ''), m.start(), m.end())
@@ -438,21 +438,25 @@ def get_agenda_content(content_map, agenda_num, agenda_title):
     if num_clean in content_map:
         return content_map[num_clean]
 
-    # 하위 안건: 상위 안건 내용에서 해당 하위 부분 탐색
+    # 하위 안건: 직계 부모 → 조부모 순으로 content_map 탐색 (3단계 대응)
     if '-' in num_clean:
-        base = num_clean.split('-')[0]
-        if base in content_map:
-            parent_content = content_map[base]
-            m = re.search(r'제\s*' + re.escape(num_clean) + r'\s*호', parent_content)
-            if m:
-                sub_start = m.start()
-                next_sub = re.search(
-                    r'제\s*' + base + r'-\d+\s*호',
-                    parent_content[sub_start + 5:]
-                )
-                if next_sub:
-                    return parent_content[sub_start: sub_start + 5 + next_sub.start()].strip()
-                return parent_content[sub_start:].strip()
+        parts = num_clean.split('-')
+        for depth in range(len(parts) - 1, 0, -1):
+            ancestor = '-'.join(parts[:depth])
+            if ancestor in content_map:
+                parent_content = content_map[ancestor]
+                m = re.search(r'제\s*' + re.escape(num_clean) + r'\s*호', parent_content)
+                if m:
+                    sub_start = m.start()
+                    # 같은 레벨의 다음 형제 안건 위치 탐색
+                    sibling_prefix = '-'.join(parts[:depth])
+                    next_sub = re.search(
+                        r'제\s*' + re.escape(sibling_prefix) + r'-\d+\s*호',
+                        parent_content[sub_start + 5:]
+                    )
+                    if next_sub:
+                        return parent_content[sub_start: sub_start + 5 + next_sub.start()].strip()
+                    return parent_content[sub_start:].strip()
 
     return ""
 
@@ -527,8 +531,8 @@ def extract_charter_tables_from_html(file_path):
             html_content = f.read()
         soup = BeautifulSoup(html_content, "lxml")
 
-        # 안건번호: "제N호", "제N-M호" 매칭 (의안 유무 무관, 조문번호 제외)
-        num_pattern = re.compile(r'제\s*(\d{1,2}(?:-\d+)?)\s*호(?:\s*의\s*안)?')
+        # 안건번호: "제N호", "제N-M호", "제N-M-L호" 매칭 (의안 유무 무관, 조문번호 제외)
+        num_pattern = re.compile(r'제\s*(\d{1,2}(?:-\d+)*)\s*호(?:\s*의\s*안)?')
 
         result = {}
         pos_counter = 0
@@ -1061,13 +1065,16 @@ def main():
                 shutil.rmtree(folder_name, ignore_errors=True)
                 continue
 
-            # ── 상위 안건 제거: 하위 안건(N-1, N-2 등)이 있으면 상위(N) 제외 ──
+            # ── 상위 안건 제거: 하위 안건이 있으면 모든 상위 레벨(조상) 제외 ──
+            # 예: "2-1-1" 존재 → "2"와 "2-1" 모두 제거
+            #     "2-1"   존재 → "2" 제거
             nums_with_subs = set()
             for item in agenda_items:
                 num = str(item.get("num", "")).strip()
-                if re.search(r'-', num):
-                    parent = num.split('-')[0]
-                    nums_with_subs.add(parent)
+                parts = num.split('-')
+                # 2단계(2-1): 조상 "2" 추가 / 3단계(2-1-1): 조상 "2", "2-1" 추가
+                for depth in range(1, len(parts)):
+                    nums_with_subs.add('-'.join(parts[:depth]))
             agenda_items = [
                 item for item in agenda_items
                 if str(item.get("num", "")).strip() not in nums_with_subs
@@ -1105,13 +1112,17 @@ def main():
                         if r.get("회사명") == corp_name and r.get("공고일") == rcept_dt
                     }
 
-                    # Fallback 1: 상위 번호(부모)로 시도 — 단, 아직 사용되지 않은 경우만
+                    # Fallback 1: 직계 부모 → 조부모 순으로 시도 (아직 미사용인 경우만)
                     if not tbl and "-" in num_clean:
-                        base = num_clean.split("-")[0]
-                        candidate = charter_tables_by_num.get(base, {})
-                        if candidate and base not in used_keys:
-                            tbl = candidate
-                            num_clean = base
+                        parts = num_clean.split("-")
+                        # 직계 부모부터 거슬러 올라가며 시도 (2-1-1 → 2-1 → 2)
+                        for depth in range(len(parts) - 1, 0, -1):
+                            ancestor = "-".join(parts[:depth])
+                            candidate = charter_tables_by_num.get(ancestor, {})
+                            if candidate and ancestor not in used_keys:
+                                tbl = candidate
+                                num_clean = ancestor
+                                break
 
                     # Fallback 2: 미매핑 표(_pos_N 포함) 중 첫 번째 사용
                     if not tbl:
