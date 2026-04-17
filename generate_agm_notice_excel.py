@@ -801,6 +801,10 @@ def classify_charter_category(before_text, after_text, purpose_text, agenda_titl
     if not bedrock_client:
         return ""
 
+    # 변경전/변경후 내용이 둘 다 비어있으면 AI 호출 불필요
+    if not before_text.strip() and not after_text.strip():
+        return ""
+
     combined = (
         f"[안건제목]\n{agenda_title}\n\n"
         f"[변경전 내용 전체 (표의 모든 행 포함)]\n{before_text}\n\n"
@@ -1187,10 +1191,13 @@ def main():
                     after_content = tbl.get("변경후 내용", "")
                     purpose = tbl.get("변경의 목적", "")
 
-                    # AI로 category2만 분류
-                    category2 = classify_charter_category(
-                        before_content, after_content, purpose, agenda_title
-                    )
+                    # AI로 category2만 분류 (변경전/변경후 내용이 둘 다 비어있으면 skip)
+                    if before_content.strip() or after_content.strip():
+                        category2 = classify_charter_category(
+                            before_content, after_content, purpose, agenda_title
+                        )
+                    else:
+                        category2 = ""
 
                 all_rows.append({
                     "회사명": corp_name,
