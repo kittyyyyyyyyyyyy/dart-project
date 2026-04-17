@@ -316,8 +316,9 @@ def parse_and_analyze_with_ai(notice_text, corp_name, full_text_fallback=""):
    - 결의사항에 있는 안건만 추출 (보고사항 제외)
    - 재무제표 승인 안건도 포함
    - 하위 안건(제N-1호, 제N-2호 등)이 있는 경우:
-       * 상위 안건 제목 + 첫 번째 하위 안건 제목 → 하나의 항목 (줄바꿈으로 연결)
-       * 두 번째 하위 안건부터 → 각각 별도 항목
+       * 상위 안건(예: 제1호)은 목록에 포함하지 않음
+       * 하위 안건(예: 제1-1호, 제1-2호)만 각각 별도 항목으로 추출
+   - 하위 안건이 없는 단독 안건은 그대로 포함
    - 원문 표현을 최대한 그대로 유지
 
    [각 항목 필드]
@@ -432,7 +433,29 @@ def get_agenda_content(content_map, agenda_num, agenda_title):
 
 
 # ─────────────────────────────────────────────
-# 5. 메인
+# 5. 안건번호 유틸
+# ─────────────────────────────────────────────
+
+def format_agenda_num(num_str):
+    """안건번호를 "제N호 의안" 형식으로 변환. 예: "2-1" → "제2-1호 의안" """
+    num_str = str(num_str).strip()
+    if not num_str:
+        return ""
+    return f"제{num_str}호 의안"
+
+
+def agenda_sort_key(num_str):
+    """안건번호 정렬키: "1" → (1, 0), "2-1" → (2, 1), "2-2" → (2, 2)"""
+    num_str = str(num_str).strip()
+    parts = re.split(r'[-.]', num_str)
+    try:
+        return tuple(int(p) for p in parts)
+    except Exception:
+        return (999,)
+
+
+# ─────────────────────────────────────────────
+# 6. 메인
 # ─────────────────────────────────────────────
 
 def main():
@@ -466,7 +489,7 @@ def main():
     fail_list = []
 
     if total_reports == 0:
-        columns = ["회사명", "시장분류", "공고일", "주총일", "안건 제목",
+        columns = ["회사명", "시장분류", "공고일", "주총일", "안건번호", "안건 제목",
                    "안건 내용", "주주제안여부", "주주제안자", "안건분류1", "안건분류2"]
         result_df = pd.DataFrame(columns=columns)
         fail_df = pd.DataFrame(fail_list, columns=["corp_name", "stock_code", "rcept_no", "reason"])
@@ -485,7 +508,7 @@ def main():
 
         market_label = ""
         if corp_cls == "Y":
-            market_label = "유가증권(코스피)"
+            market_label = "유가증권"
         elif corp_cls == "K":
             market_label = "코스닥"
 
@@ -508,6 +531,13 @@ def main():
             # 소집공고 섹션 / 목적사항별 기재사항 섹션 분리 추출
             notice_text, section2_text, full_text = extract_text_sections(main_file)
 
+            # ── 임시주주총회 제외: 소집공고 앞부분에 "임시주주총회" 표현 시 스킵 ──
+            check_area = notice_text[:3000] if notice_text else full_text[:3000]
+            if "임시주주총회" in check_area:
+                fail_list.append([corp_name, stock_code, rcept_no, "임시주주총회_제외"])
+                shutil.rmtree(folder_name, ignore_errors=True)
+                continue
+
             # AI로 D/E열 파싱 + G/H/I/J열 분석 (보고서 1건당 1회 호출)
             # notice_text가 짧으면 full_text를 fallback으로 전달
             parsed = parse_and_analyze_with_ai(notice_text, corp_name,
@@ -517,11 +547,25 @@ def main():
             ai_error = parsed.get("error", "")
 
             if not agenda_items:
-                # 원인을 구체적으로 기록 (OPENAI_API_KEY 미설정인지, AI가 빈값 반환인지 등)
                 reason = ai_error if ai_error else "ai_returned_no_agenda_items"
                 fail_list.append([corp_name, stock_code, rcept_no, reason])
                 shutil.rmtree(folder_name, ignore_errors=True)
                 continue
+
+            # ── 상위 안건 제거: 하위 안건(N-1, N-2 등)이 있으면 상위(N) 제외 ──
+            nums_with_subs = set()
+            for item in agenda_items:
+                num = str(item.get("num", "")).strip()
+                if re.search(r'-', num):
+                    parent = num.split('-')[0]
+                    nums_with_subs.add(parent)
+            agenda_items = [
+                item for item in agenda_items
+                if str(item.get("num", "")).strip() not in nums_with_subs
+            ]
+
+            # ── 안건번호 순 정렬 ──
+            agenda_items.sort(key=lambda x: agenda_sort_key(str(x.get("num", ""))))
 
             # F열용 section2 내용 맵 구성
             content_map = build_section2_content_map(section2_text)
@@ -536,6 +580,7 @@ def main():
                     "시장분류": market_label,
                     "공고일": rcept_dt,
                     "주총일": meeting_date,
+                    "안건번호": format_agenda_num(agenda_num),
                     "안건 제목": agenda_title,
                     "안건 내용": agenda_content,
                     "주주제안여부": str(item.get("shareholder_proposal", "")),
