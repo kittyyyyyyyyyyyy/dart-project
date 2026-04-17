@@ -332,7 +332,7 @@ def parse_and_analyze_with_ai(notice_text, corp_name, full_text_fallback=""):
    - shareholder_proposal: 해당 안건 앞에 "(주주제안)" 명시 시 "Y", 아니면 "N"
    - proposer: shareholder_proposal이 "Y"이면 제안 주주명, 아니면 ""
    - category1: "재무제표승인" / "이사감사선임" / "정관변경" / "이사감사보수" / "자사주보유처분계획승인" / "기타" 중 하나
-   - category2: category1이 "정관변경"일 때만 "이사 임기 유연화" / "이사 임기 연장" / "이사 정원 축소" / "자사주 보유" / "기타 개정 상법 반영" 중 하나, 나머지는 ""
+   - category2: 빈 문자열("")로 반환 (정관변경 안건의 세부 분류는 별도 처리됨)
 
 반환 규칙:
 - 반드시 순수 JSON만 반환할 것
@@ -438,7 +438,85 @@ def get_agenda_content(content_map, agenda_num, agenda_title):
 
 
 # ─────────────────────────────────────────────
-# 5. 안건번호 유틸
+# 5. 정관변경 상세 분석 (AI 2차 호출)
+# ─────────────────────────────────────────────
+
+def analyze_charter_amendment(content_text, agenda_num, agenda_title):
+    """
+    정관변경 안건의 section2 내용을 AI로 분석해
+    구분 / 변경전 / 변경후 / 변경의 목적 및 안건분류2를 반환한다.
+    """
+    empty = {"category2": "", "charter_division": "",
+             "before_content": "", "after_content": "", "purpose": ""}
+
+    if not bedrock_client:
+        return empty
+
+    text_excerpt = (content_text or "").strip()
+    if not text_excerpt:
+        return empty
+
+    prompt = f"""다음은 정관변경 안건(안건번호: {agenda_num}, 제목: {agenda_title})의 상세 내용입니다.
+
+{text_excerpt[:6000]}
+
+아래 정보를 JSON으로 추출·분석하세요. 반드시 JSON만 반환하고 다른 텍스트는 포함하지 마세요.
+
+1. category2: 아래 분류 기준을 적용하세요.
+   ※ "기타"를 제외하고 두 가지 이상 해당 시 쉼표로 구분해 모두 기재 (예: "이사 정원 축소, 자사주 보유")
+   ※ 위 네 가지 중 하나도 해당 없으면 "기타"
+
+   - "이사 임기 유연화": 이사의 임기가 고정 숫자이었으나, 상한만 두고 유연하게 정할 수 있도록 개정된 경우.
+     예) "이사의 임기는 3년으로 한다" → "이사의 임기는 3년을 초과하지 못한다"
+     (핵심: 기존엔 특정 연도로 고정, 이후엔 '초과하지 못한다'/'이내' 형태로 상한만 설정)
+
+   - "이사 임기 연장": 이사의 임기 기간 수치 자체가 늘어난 경우.
+     예) "취임 후 2년 내의 최종 결산기" → "취임 후 3년 내의 최종 결산기"
+     (핵심: 연도 숫자가 증가)
+
+   - "이사 정원 축소": 이사회 정원의 상한이 신설되거나 기존 상한이 줄어든 경우.
+     예) "3명 이상 16명 이내" → "3명 이상 9인 이하"
+     (핵심: 상한 숫자가 감소하거나 새로 생긴 경우)
+
+   - "자사주 보유": 자기주식의 보유 또는 처분에 관한 정관 신설 또는 변경.
+     예) 회사가 경영상 목적 등을 위해 자기주식을 보유·처분할 수 있다는 조항 신설
+
+   - "기타": 위 네 분류 중 하나도 해당 없는 경우.
+
+2. charter_division: 해당 의안의 의안번호·제목·구분·전체적 설명 등 항목의 내용 전체.
+   표가 여러 행이면 각 행을 줄바꿈(\\n)으로 연결.
+
+3. before_content: "변경전 내용" 열에 해당하는 내용 전체.
+   표가 여러 행이면 각 행을 줄바꿈(\\n)으로 연결.
+
+4. after_content: "변경후 내용" 열에 해당하는 내용 전체.
+   표가 여러 행이면 각 행을 줄바꿈(\\n)으로 연결.
+
+5. purpose: "변경의 목적" 열에 해당하는 내용 전체.
+   표가 여러 행이면 각 행을 줄바꿈(\\n)으로 연결.
+
+반환 규칙:
+- 반드시 순수 JSON만 반환할 것
+- 코드블록(```) 절대 사용 금지
+- 해당 내용이 없으면 빈 문자열("")
+
+반환 형식:
+{{"category2": "...", "charter_division": "...", "before_content": "...", "after_content": "...", "purpose": "..."}}"""
+
+    try:
+        raw_text = call_bedrock(prompt)
+        result = extract_json(raw_text)
+        if result is None:
+            print(f"정관변경 분석 JSON 파싱 실패 ({agenda_num}): {raw_text[:200]}")
+            return empty
+        return result
+    except Exception as e:
+        print(f"정관변경 분석 오류 ({agenda_num}): {e}")
+        return empty
+
+
+# ─────────────────────────────────────────────
+# 6. 안건번호 유틸
 # ─────────────────────────────────────────────
 
 def format_agenda_num(num_str):
@@ -495,7 +573,9 @@ def main():
 
     if total_reports == 0:
         columns = ["회사명", "시장분류", "공고일", "주총일", "안건번호", "안건 제목",
-                   "안건 내용", "주주제안여부", "주주제안자", "안건분류1", "안건분류2"]
+                   "주주제안여부", "주주제안자", "안건분류1", "안건분류2",
+                   "[정관변경] 구분", "[정관변경] 변경전 내용", "[정관변경] 변경후 내용",
+                   "[정관변경] 변경의 목적", "안건 내용"]
         result_df = pd.DataFrame(columns=columns)
         fail_df = pd.DataFrame(fail_list, columns=["corp_name", "stock_code", "rcept_no", "reason"])
         with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
@@ -579,6 +659,29 @@ def main():
                 agenda_num = str(item.get("num", ""))
                 agenda_title = str(item.get("title", ""))
                 agenda_content = get_agenda_content(content_map, agenda_num, agenda_title)
+                category1 = str(item.get("category1", ""))
+                category2 = str(item.get("category2", ""))
+
+                # ── 정관변경 안건: AI 2차 호출로 상세 내용 추출 및 분류 ──
+                charter_division = ""
+                before_content = ""
+                after_content = ""
+                purpose = ""
+
+                if category1 == "정관변경":
+                    num_clean = agenda_num.replace(' ', '')
+                    charter_text = content_map.get(num_clean, "")
+                    # content_map에 없으면 agenda_content(get_agenda_content 결과) 사용
+                    if not charter_text:
+                        charter_text = agenda_content
+                    charter_result = analyze_charter_amendment(
+                        charter_text, agenda_num, agenda_title
+                    )
+                    category2 = charter_result.get("category2", "")
+                    charter_division = charter_result.get("charter_division", "")
+                    before_content = charter_result.get("before_content", "")
+                    after_content = charter_result.get("after_content", "")
+                    purpose = charter_result.get("purpose", "")
 
                 all_rows.append({
                     "회사명": corp_name,
@@ -587,11 +690,15 @@ def main():
                     "주총일": meeting_date,
                     "안건번호": format_agenda_num(agenda_num),
                     "안건 제목": agenda_title,
-                    "안건 내용": agenda_content,
                     "주주제안여부": str(item.get("shareholder_proposal", "")),
                     "주주제안자": str(item.get("proposer", "")),
-                    "안건분류1": str(item.get("category1", "")),
-                    "안건분류2": str(item.get("category2", "")),
+                    "안건분류1": category1,
+                    "안건분류2": category2,
+                    "[정관변경] 구분": charter_division,
+                    "[정관변경] 변경전 내용": before_content,
+                    "[정관변경] 변경후 내용": after_content,
+                    "[정관변경] 변경의 목적": purpose,
+                    "안건 내용": agenda_content,  # 항상 맨 마지막 열
                 })
 
         except Exception as e:
