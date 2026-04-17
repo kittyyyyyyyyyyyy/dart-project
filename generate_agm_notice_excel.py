@@ -197,9 +197,14 @@ def fetch_agm_notice_reports(start_date, end_date, company_names=None, progress_
                 page_no += 1
                 time.sleep(0.12)
 
+    # corp_code 기준으로 가장 최근 공고(rcept_no 최대값)만 남김
+    # → 정정공고가 있으면 정정공고만, 없으면 원본만 엑셀에 포함
     dedup = {}
     for item in all_results:
-        dedup[item["rcept_no"]] = item
+        corp_code = item.get("corp_code", item["rcept_no"])
+        existing = dedup.get(corp_code)
+        if existing is None or item["rcept_no"] > existing["rcept_no"]:
+            dedup[corp_code] = item
     return list(dedup.values())
 
 
