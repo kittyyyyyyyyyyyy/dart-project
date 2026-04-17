@@ -445,16 +445,25 @@ def extract_charter_tables_from_html(file_path):
     """
     HTML에서 정관변경 표(변경전/변경후/목적 열)를 파싱한다.
 
+    헤더 지원:
+    - "변경전/변경후" 또는 "현행/개정안" 형태 모두 인식
+
+    섹션 분리 (사례2 대응):
+    - 표 안에 "구분" 컬럼이 있고, 그 행의 변경전/변경후가 모두 비어있는 경우
+      → 섹션 헤더 행으로 판정, 이전 섹션 저장 후 새 섹션 시작
+    - 섹션이 2개 이상 검출되면 각각 _pos_N 키로 저장
+      (하나의 큰 표가 여러 안건을 포함하는 경우 처리)
+
     매핑 전략:
-    - 표 직전 텍스트에서 안건번호(제N호, 제N-M호, 의안 유무 무관) 탐색 → 번호 키
-    - 안건번호 미발견 시 → "_pos_N" 위치 키 (순서 기반 fallback용)
+    - 섹션이 1개: 표 직전 안건번호(제N호, 제N-M호) 탐색 → 번호 키 / 없으면 _pos_N
+    - 섹션이 복수: 모두 _pos_N (순서 기반 fallback으로 안건에 할당)
 
     구분 결정:
-    - 표에 "구분" 컬럼이 있으면 해당 컬럼 값을 사용 (사례2: 가/나 방식)
+    - 섹션 헤더 행이 있으면 그 값 사용
     - 없으면 표 직전 제목 텍스트 사용
 
     빈 표 필터:
-    - 변경전/변경후가 모두 대시(—) 또는 "해당사항 없음"인 표는 제외
+    - 변경전/변경후가 모두 대시(—) 또는 "해당사항 없음"인 섹션은 제외
     """
     def is_trivial(texts):
         combined = " ".join(texts)
@@ -466,8 +475,7 @@ def extract_charter_tables_from_html(file_path):
             html_content = f.read()
         soup = BeautifulSoup(html_content, "lxml")
 
-        # "의안" 없이도 매칭 (제2-2호: → O, 제24조 → X)
-        # 안건번호는 통상 20 이하라고 가정해 오매칭 방지
+        # 안건번호: "제N호", "제N-M호" 매칭 (의안 유무 무관, 조문번호 제외)
         num_pattern = re.compile(r'제\s*(\d{1,2}(?:-\d+)?)\s*호(?:\s*의\s*안)?')
 
         result = {}
@@ -478,22 +486,28 @@ def extract_charter_tables_from_html(file_path):
             if not rows:
                 continue
 
-            # ── 헤더 행 탐색 ──
+            # ── 헤더 행 탐색: 변경전/변경후 또는 현행/개정안 ──
             header_row_idx = None
             col_map = {}
             for ri, row in enumerate(rows[:5]):
                 cells = row.find_all(["th", "td"])
                 headers = [c.get_text(separator=" ", strip=True) for c in cells]
                 joined = " ".join(headers)
-                if ("변경전" in joined or "변경 전" in joined) and \
-                   ("변경후" in joined or "변경 후" in joined):
+                has_before = ("변경전" in joined or "변경 전" in joined or "현행" in joined)
+                has_after = ("변경후" in joined or "변경 후" in joined
+                             or "개정안" in joined or "개정 안" in joined)
+                if has_before and has_after:
                     for i, h in enumerate(headers):
-                        # "구분" 컬럼: 변경/목적 관련 단어 없이 "구분"만 있는 경우
-                        if "구분" in h and "변경" not in h and "목적" not in h:
+                        h_norm = h.replace(" ", "")
+                        if ("구분" in h and "변경" not in h and "목적" not in h
+                                and "현행" not in h and "개정" not in h):
                             col_map["구분"] = i
-                        elif "변경전" in h or "변경 전" in h:
+                        elif "변경전" in h or "변경 전" in h or (
+                                "현행" in h and "변경" not in h
+                                and "목적" not in h and "개정" not in h):
                             col_map["변경전 내용"] = i
-                        elif "변경후" in h or "변경 후" in h:
+                        elif ("변경후" in h or "변경 후" in h
+                              or "개정안" in h or "개정 안" in h):
                             col_map["변경후 내용"] = i
                         elif "목적" in h:
                             col_map["변경의 목적"] = i
@@ -504,26 +518,39 @@ def extract_charter_tables_from_html(file_path):
                 continue
 
             # ── 표 직전 역방향 안건번호 탐색 ──
-            agenda_num = None
+            agenda_num_for_table = None
             division_from_heading = ""
             for prev in table.find_all_previous(True):
                 if prev.find_parent("table"):
-                    continue                   # 다른 표 내부 → 스킵
+                    continue
                 if prev.name == "table":
-                    break                      # 이전 표 만나면 중단
+                    break
                 if prev.name in ["script", "style", "head"]:
                     continue
                 text = prev.get_text(separator=" ", strip=True)
                 if text:
                     m = num_pattern.search(text)
                     if m:
-                        agenda_num = m.group(1).replace(" ", "")
-                        division_from_heading = text[:500]
-                        break
+                        num_str = m.group(1).replace(" ", "")
+                        base_num = int(re.split(r'-', num_str)[0])
+                        if base_num <= 20:
+                            agenda_num_for_table = num_str
+                            division_from_heading = text[:500]
+                            break
 
-            # ── 데이터 행 추출 ──
-            division_col_vals = []
-            col_texts = {"변경전 내용": [], "변경후 내용": [], "변경의 목적": []}
+            # ── 열 인덱스 ──
+            구분_idx = col_map.get("구분", -1)
+            bf_idx   = col_map.get("변경전 내용", -1)
+            af_idx   = col_map.get("변경후 내용", -1)
+            목적_idx  = col_map.get("변경의 목적", -1)
+            has_구분_col = 구분_idx >= 0
+
+            # ── 데이터 행 처리: 섹션 분리 ──
+            # 섹션 헤더 행: 구분 컬럼이 있고 구분값은 비어있지 않으나 변경전/변경후가 모두 빈 행
+            sections = []
+            current_label = division_from_heading
+            current_data  = {"변경전 내용": [], "변경후 내용": [], "변경의 목적": []}
+            found_section_headers = False
 
             for row in rows[header_row_idx + 1:]:
                 cells = row.find_all(["th", "td"])
@@ -531,41 +558,72 @@ def extract_charter_tables_from_html(file_path):
                     continue
                 row_texts = [c.get_text(separator="\n", strip=True) for c in cells]
 
-                if "구분" in col_map:
-                    idx = col_map["구분"]
-                    val = row_texts[idx] if idx < len(row_texts) else ""
-                    if val:
-                        division_col_vals.append(val)
+                구분_val = (row_texts[구분_idx]
+                            if has_구분_col and 구분_idx < len(row_texts) else "").strip()
+                bf_val   = (row_texts[bf_idx]
+                            if bf_idx >= 0 and bf_idx < len(row_texts) else "").strip()
+                af_val   = (row_texts[af_idx]
+                            if af_idx >= 0 and af_idx < len(row_texts) else "").strip()
 
-                for key in ["변경전 내용", "변경후 내용", "변경의 목적"]:
-                    if key in col_map:
-                        idx = col_map[key]
-                        val = row_texts[idx] if idx < len(row_texts) else ""
-                        if val:
-                            col_texts[key].append(val)
+                # 섹션 헤더 행 감지
+                if has_구분_col and 구분_val and not bf_val and not af_val:
+                    # 이전 섹션 저장 (데이터가 있으면)
+                    if any(current_data[k] for k in current_data):
+                        sections.append({"label": current_label, "data": current_data})
+                    current_label = 구분_val
+                    current_data  = {"변경전 내용": [], "변경후 내용": [], "변경의 목적": []}
+                    found_section_headers = True
+                    continue
 
-            # ── 실질 내용 없는 표 스킵 (집중투표 배제 등) ──
-            if is_trivial(col_texts.get("변경전 내용", [])) and \
-               is_trivial(col_texts.get("변경후 내용", [])):
+                # 데이터 행 수집
+                if bf_val:
+                    current_data["변경전 내용"].append(bf_val)
+                if af_val:
+                    current_data["변경후 내용"].append(af_val)
+                if 목적_idx >= 0 and 목적_idx < len(row_texts):
+                    p_val = row_texts[목적_idx].strip()
+                    if p_val:
+                        current_data["변경의 목적"].append(p_val)
+
+            # 마지막 섹션 저장
+            if any(current_data[k] for k in current_data):
+                sections.append({"label": current_label, "data": current_data})
+
+            if not sections:
                 continue
 
-            # ── [정관] 구분 결정: 표 내 구분 컬럼 > 표 직전 제목 ──
-            final_division = "\n".join(division_col_vals) if division_col_vals \
-                             else division_from_heading
-
-            entry = {
-                "구분": final_division,
-                "변경전 내용": "\n".join(col_texts.get("변경전 내용", [])),
-                "변경후 내용": "\n".join(col_texts.get("변경후 내용", [])),
-                "변경의 목적": "\n".join(col_texts.get("변경의 목적", [])),
-            }
-
-            # ── 키 결정: 안건번호 > 위치 키 ──
-            if agenda_num and agenda_num not in result:
-                result[agenda_num] = entry
+            # ── 섹션 저장 ──
+            if found_section_headers or len(sections) > 1:
+                # 복수 섹션 → 각각 _pos_N
+                for sec in sections:
+                    if (is_trivial(sec["data"].get("변경전 내용", []))
+                            and is_trivial(sec["data"].get("변경후 내용", []))):
+                        continue
+                    entry = {
+                        "구분": sec["label"],
+                        "변경전 내용": "\n".join(sec["data"].get("변경전 내용", [])),
+                        "변경후 내용": "\n".join(sec["data"].get("변경후 내용", [])),
+                        "변경의 목적": "\n".join(sec["data"].get("변경의 목적", [])),
+                    }
+                    result[f"_pos_{pos_counter}"] = entry
+                    pos_counter += 1
             else:
-                result[f"_pos_{pos_counter}"] = entry
-                pos_counter += 1
+                # 단일 섹션 → 안건번호 키 또는 _pos_N
+                sec = sections[0]
+                if (is_trivial(sec["data"].get("변경전 내용", []))
+                        and is_trivial(sec["data"].get("변경후 내용", []))):
+                    continue
+                entry = {
+                    "구분": division_from_heading,
+                    "변경전 내용": "\n".join(sec["data"].get("변경전 내용", [])),
+                    "변경후 내용": "\n".join(sec["data"].get("변경후 내용", [])),
+                    "변경의 목적": "\n".join(sec["data"].get("변경의 목적", [])),
+                }
+                if agenda_num_for_table and agenda_num_for_table not in result:
+                    result[agenda_num_for_table] = entry
+                else:
+                    result[f"_pos_{pos_counter}"] = entry
+                    pos_counter += 1
 
         return result
 
@@ -618,12 +676,23 @@ def classify_charter_category(before_text, after_text, purpose_text, agenda_titl
 결과를 JSON으로만 반환. 다른 텍스트 없이 JSON만.
 반환 형식: {{"category2": "..."}}"""
 
+    ALLOWED = {"이사 임기 유연화", "이사 임기 연장", "이사 정원 축소", "자사주 보유", "기타"}
+
     try:
         raw_text = call_bedrock(prompt)
         result = extract_json(raw_text)
-        if result:
-            return str(result.get("category2", "기타"))
-        return "기타"
+        if not result:
+            return "기타"
+
+        raw_cat = str(result.get("category2", "기타")).strip()
+
+        # 쉼표 구분 리스트에서 허용 값만 남김
+        parts = [p.strip() for p in raw_cat.split(",")]
+        valid_parts = [p for p in parts if p in ALLOWED and p != "기타"]
+        if not valid_parts:
+            return "기타"
+        return ", ".join(valid_parts)
+
     except Exception as e:
         print(f"안건분류2 분류 오류: {e}")
         return ""
