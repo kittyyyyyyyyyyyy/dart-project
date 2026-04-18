@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Query
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
@@ -14,7 +15,19 @@ import xml.etree.ElementTree as ET
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # startup: 회사명 캐시 로드
+    ensure_company_cache_loaded()
+    if company_cache.get("source") in ("file", "local_xml"):
+        t = threading.Thread(target=refresh_company_cache_in_background, daemon=True)
+        t.start()
+    yield
+    # shutdown: 별도 정리 불필요
+
+
+app = FastAPI(lifespan=lifespan)
 
 API_KEY = os.getenv("DART_API_KEY")
 jobs = {}
@@ -163,14 +176,7 @@ def refresh_company_cache_in_background():
         print("회사명 캐시 백그라운드 갱신 실패:", str(e))
 
 
-@app.on_event("startup")
-def startup_event():
-    ensure_company_cache_loaded()
-    # DART API에서 방금 받은 경우엔 바로 갱신 불필요
-    # 로컬 XML 또는 파일에서 로드된 경우만 백그라운드에서 최신화
-    if company_cache.get("source") in ("file", "local_xml"):
-        t = threading.Thread(target=refresh_company_cache_in_background, daemon=True)
-        t.start()
+# startup logic은 lifespan 컨텍스트 매니저로 이동 (파일 상단 참조)
 
 
 class DownloadRequest(BaseModel):
