@@ -4,14 +4,14 @@ runtime: python311
 build:
   commands:
     build:
-      - python3 -m pip install --upgrade pip
-      - python3 -m pip install -r requirements.txt
+      - pip3 install -r requirements.txt
 
 run:
   runtime-version: 3.11
   command: python3 -m uvicorn server:app --host 0.0.0.0 --port 8000
   network:
     port: 8000
+    env: PORT
   secrets:
     - name: DART_API_KEY
       value-from: "arn:aws:secretsmanager:us-east-1:149997403349:secret:DART_API_KEY-DcBt2m"

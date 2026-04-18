@@ -17,33 +17,27 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 BASE_DIR = Path(__file__).resolve().parent
-RUNTIME_DIR = BASE_DIR / "runtime_data"
-RUNTIME_DIR.mkdir(exist_ok=True)
+INDEX_HTML = BASE_DIR / "index.html"
+COMPANY_CACHE_FILE = BASE_DIR / "company_names.json"
+LOCAL_CORP_XML = BASE_DIR / "corp_data" / "CORPCODE.xml"
+API_KEY = os.getenv("DART_API_KEY")
 
 app = FastAPI()
-
-API_KEY = os.getenv("DART_API_KEY")
 jobs = {}
-
-COMPANY_CACHE_FILE = RUNTIME_DIR / "company_names.json"
-LOCAL_CORP_XML = BASE_DIR / "corp_data" / "CORPCODE.xml"
-INDEX_HTML = BASE_DIR / "index.html"
-
 company_cache = {
     "loaded_at": 0,
     "names": [],
     "source": None
 }
-_company_lock = threading.Lock()
 
 
 def make_session():
     session = requests.Session()
     retry = Retry(
-        total=5,
-        connect=5,
-        read=5,
-        backoff_factor=1.5,
+        total=3,
+        connect=3,
+        read=3,
+        backoff_factor=1.0,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET"]
     )
@@ -92,24 +86,20 @@ def load_company_names_from_local_xml():
 def fetch_company_names_from_dart():
     if not API_KEY:
         return []
-
     url = "https://opendart.fss.or.kr/api/corpCode.xml"
     params = {"crtfc_key": API_KEY}
-
-    res = http.get(url, params=params, timeout=(20, 120))
+    res = http.get(url, params=params, timeout=(20, 60))
     res.raise_for_status()
     z = zipfile.ZipFile(io.BytesIO(res.content))
     xml_filename = z.namelist()[0]
     xml_content = z.read(xml_filename)
     root = ET.fromstring(xml_content)
-
     names = set()
     for item in root.findall("list"):
         corp_name = item.findtext("corp_name", default="").strip()
         stock_code = item.findtext("stock_code", default="").strip()
         if corp_name and stock_code:
             names.add(corp_name)
-
     return sorted(names)
 
 
@@ -117,38 +107,37 @@ def ensure_company_cache_loaded():
     if company_cache["names"]:
         return company_cache["names"]
 
-    with _company_lock:
-        if company_cache["names"]:
-            return company_cache["names"]
+    file_names = load_company_names_from_file()
+    if file_names:
+        company_cache["names"] = file_names
+        company_cache["loaded_at"] = time.time()
+        company_cache["source"] = "file"
+        return file_names
 
-        file_names = load_company_names_from_file()
-        if file_names:
-            company_cache["names"] = file_names
-            company_cache["loaded_at"] = time.time()
-            company_cache["source"] = "file"
-            return file_names
-
-        xml_names = load_company_names_from_local_xml()
-        if xml_names:
-            company_cache["names"] = xml_names
-            company_cache["loaded_at"] = time.time()
-            company_cache["source"] = "local_xml"
-            try:
-                save_company_names_to_file(xml_names)
-            except Exception as e:
-                print("회사명 캐시 파일 저장 실패:", e)
-            return xml_names
-
+    xml_names = load_company_names_from_local_xml()
+    if xml_names:
+        company_cache["names"] = xml_names
+        company_cache["loaded_at"] = time.time()
+        company_cache["source"] = "local_xml"
         try:
-            names = fetch_company_names_from_dart()
-            company_cache["names"] = names
-            company_cache["loaded_at"] = time.time()
-            company_cache["source"] = "dart"
+            save_company_names_to_file(xml_names)
+        except Exception:
+            pass
+        return xml_names
+
+    try:
+        names = fetch_company_names_from_dart()
+        company_cache["names"] = names
+        company_cache["loaded_at"] = time.time()
+        company_cache["source"] = "dart"
+        try:
             save_company_names_to_file(names)
-            return names
-        except Exception as e:
-            print("회사명 목록 초기 로드 실패:", str(e))
-            return []
+        except Exception:
+            pass
+        return names
+    except Exception as e:
+        print("회사명 목록 초기 로드 실패:", str(e))
+        return []
 
 
 class DownloadRequest(BaseModel):
@@ -170,34 +159,25 @@ def monitor_process(job_id, proc):
     jobs[job_id]["finished_at"] = time.time()
 
 
-def _script_path(name: str) -> str:
-    return str(BASE_DIR / name)
-
-
-def _job_file(name: str) -> str:
-    return str(RUNTIME_DIR / name)
-
-
-def _start_job(job_id: str, args: list[str], output_file: str, progress_file: str):
+def _spawn_job(job_id: str, output_file: Path, progress_file: Path, args: list[str]):
     proc = subprocess.Popen(
         args,
+        cwd=str(BASE_DIR),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        cwd=str(BASE_DIR)
     )
     jobs[job_id] = {
         "process": proc,
-        "output_file": output_file,
-        "progress_file": progress_file,
+        "output_file": str(output_file),
+        "progress_file": str(progress_file),
         "stdout": "",
         "stderr": "",
         "returncode": None,
-        "created_at": time.time()
+        "created_at": time.time(),
     }
     t = threading.Thread(target=monitor_process, args=(job_id, proc), daemon=True)
     t.start()
-    return {"job_id": job_id}
 
 
 @app.get("/")
@@ -218,11 +198,10 @@ def health():
 @app.get("/startup-debug")
 def startup_debug():
     return {
-        "base_dir": str(BASE_DIR),
         "cwd": os.getcwd(),
+        "base_dir": str(BASE_DIR),
         "index_exists": INDEX_HTML.exists(),
         "corp_xml_exists": LOCAL_CORP_XML.exists(),
-        "runtime_dir_exists": RUNTIME_DIR.exists(),
         "python": sys.executable,
     }
 
@@ -230,7 +209,10 @@ def startup_debug():
 @app.get("/env-check")
 def env_check():
     value = os.getenv("DART_API_KEY")
-    return {"has_key": bool(value), "prefix": value[:5] if value else None}
+    return {
+        "has_key": bool(value),
+        "prefix": value[:5] if value else None
+    }
 
 
 @app.get("/company-suggestions")
@@ -241,9 +223,9 @@ def company_suggestions(q: str = Query(...)):
 
     all_names = ensure_company_cache_loaded()
     q_lower = keyword.lower()
-
     starts = []
     contains = []
+
     for name in all_names:
         lower_name = name.lower()
         if lower_name.startswith(q_lower):
@@ -260,75 +242,78 @@ def company_suggestions(q: str = Query(...)):
 @app.post("/start-download")
 def start_download(payload: DownloadRequest):
     job_id = str(uuid.uuid4())[:8]
-    output_file = _job_file(f"filtered_result_{job_id}.xlsx")
-    progress_file = _job_file(f"progress_{job_id}.json")
+    output_file = BASE_DIR / f"filtered_result_{job_id}.xlsx"
+    progress_file = BASE_DIR / f"progress_{job_id}.json"
     args = [
         sys.executable,
-        _script_path("generate_filtered_excel.py"),
+        "generate_filtered_excel.py",
         "--start-date", payload.start_date,
         "--end-date", payload.end_date,
         "--companies-json", json.dumps(payload.companies, ensure_ascii=False),
-        "--output", output_file,
-        "--progress-file", progress_file,
+        "--output", str(output_file),
+        "--progress-file", str(progress_file),
     ]
-    return _start_job(job_id, args, output_file, progress_file)
+    _spawn_job(job_id, output_file, progress_file, args)
+    return {"job_id": job_id}
 
 
 @app.post("/start-regular-download")
 def start_regular_download(payload: DownloadRequest):
     job_id = str(uuid.uuid4())[:8]
-    output_file = _job_file(f"regular_meeting_result_{job_id}.xlsx")
-    progress_file = _job_file(f"progress_regular_{job_id}.json")
+    output_file = BASE_DIR / f"regular_meeting_result_{job_id}.xlsx"
+    progress_file = BASE_DIR / f"progress_regular_{job_id}.json"
     args = [
         sys.executable,
-        _script_path("generate_regular_meeting_excel.py"),
+        "generate_regular_meeting_excel.py",
         "--start-date", payload.start_date,
         "--end-date", payload.end_date,
         "--companies-json", json.dumps(payload.companies, ensure_ascii=False),
-        "--output", output_file,
-        "--progress-file", progress_file,
+        "--output", str(output_file),
+        "--progress-file", str(progress_file),
     ]
-    return _start_job(job_id, args, output_file, progress_file)
+    _spawn_job(job_id, output_file, progress_file, args)
+    return {"job_id": job_id}
 
 
 @app.post("/start-agm-notice-download")
 def start_agm_notice_download(payload: DownloadRequest):
     job_id = str(uuid.uuid4())[:8]
-    output_file = _job_file(f"agm_notice_result_{job_id}.xlsx")
-    progress_file = _job_file(f"progress_agm_{job_id}.json")
+    output_file = BASE_DIR / f"agm_notice_result_{job_id}.xlsx"
+    progress_file = BASE_DIR / f"progress_agm_{job_id}.json"
     args = [
         sys.executable,
-        _script_path("generate_agm_notice_excel.py"),
+        "generate_agm_notice_excel.py",
         "--start-date", payload.start_date,
         "--end-date", payload.end_date,
         "--companies-json", json.dumps(payload.companies, ensure_ascii=False),
-        "--output", output_file,
-        "--progress-file", progress_file,
+        "--output", str(output_file),
+        "--progress-file", str(progress_file),
     ]
-    return _start_job(job_id, args, output_file, progress_file)
+    _spawn_job(job_id, output_file, progress_file, args)
+    return {"job_id": job_id}
 
 
 @app.post("/start-kind-download")
 def start_kind_download(payload: KindDownloadRequest):
     job_id = str(uuid.uuid4())[:8]
-    output_file = _job_file(f"kind_institution_result_{job_id}.xlsx")
-    progress_file = _job_file(f"progress_kind_{job_id}.json")
+    output_file = BASE_DIR / f"kind_institution_result_{job_id}.xlsx"
+    progress_file = BASE_DIR / f"progress_kind_{job_id}.json"
     args = [
         sys.executable,
-        _script_path("generate_kind_institution_excel.py"),
+        "generate_kind_institution_excel.py",
         "--start-date", payload.start_date,
         "--end-date", payload.end_date,
-        "--output", output_file,
-        "--progress-file", progress_file,
+        "--output", str(output_file),
+        "--progress-file", str(progress_file),
     ]
-    return _start_job(job_id, args, output_file, progress_file)
+    _spawn_job(job_id, output_file, progress_file, args)
+    return {"job_id": job_id}
 
 
 @app.get("/job-status/{job_id}")
 def job_status(job_id: str):
     if job_id not in jobs:
         return JSONResponse(status_code=404, content={"error": "job not found"})
-
     job = jobs[job_id]
     proc = job["process"]
     progress = {
@@ -338,17 +323,14 @@ def job_status(job_id: str):
         "current": 0,
         "total": 0,
     }
-
     if os.path.exists(job["progress_file"]):
         try:
             with open(job["progress_file"], "r", encoding="utf-8") as f:
                 progress = json.load(f)
         except Exception:
             pass
-
     if proc.poll() is None:
         return {"job_id": job_id, "state": "running", "progress": progress}
-
     if job["returncode"] != 0:
         return {
             "job_id": job_id,
@@ -357,7 +339,6 @@ def job_status(job_id: str):
             "stdout": job["stdout"],
             "stderr": job["stderr"],
         }
-
     if os.path.exists(job["output_file"]):
         return {
             "job_id": job_id,
@@ -371,7 +352,6 @@ def job_status(job_id: str):
             },
             "download_url": f"/download-file/{job_id}",
         }
-
     return {
         "job_id": job_id,
         "state": "error",
@@ -386,13 +366,11 @@ def job_status(job_id: str):
 def download_file(job_id: str):
     if job_id not in jobs:
         return JSONResponse(status_code=404, content={"error": "job not found"})
-
     output_file = jobs[job_id]["output_file"]
     if not os.path.exists(output_file):
         return JSONResponse(status_code=404, content={"error": "file not found"})
-
     return FileResponse(
         path=output_file,
-        filename=os.path.basename(output_file),
+        filename=Path(output_file).name,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
