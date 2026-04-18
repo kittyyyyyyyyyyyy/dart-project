@@ -287,12 +287,14 @@ def extract_text_sections(file_path):
 
     # "부의안건" 또는 "목적사항" 위치 탐색
     # ★ 정정공고는 비교표 안에도 같은 키워드가 등장하므로 반드시 마지막(가장 뒤) 위치를 사용
-    # ★ 호텔신라 등 일부 회사는 "부의안건" 대신 "4. 목적사항" 표현 사용
+    # ★ 호텔신라 등: "부의안건" 대신 "3. 회의 목적사항" 형태 사용
+    #    → [3-6].\s*목적사항 패턴이 "회의"가 끼면 실패하므로 넓은 패턴으로 대체
     agenda_section_pats = [
         r'나\s*[\.．]\s*부\s*의\s*안\s*건',
         r'나\s*\.\s*부의안건',
         r'부\s*의\s*안\s*건',
-        r'[3-6]\s*\.\s*목\s*적\s*사\s*항',
+        r'[2-7]\s*[\.．]\s*[가-힣\s]{0,10}목\s*적\s*사\s*항',  # "3. 회의 목적사항" 등 포함
+        r'목\s*적\s*사\s*항',  # 최후 fallback: 패턴 없이 "목적사항"만으로 탐색
     ]
     agenda_pos = -1
     for pat in agenda_section_pats:
@@ -302,10 +304,8 @@ def extract_text_sections(file_path):
             break
 
     if agenda_pos != -1:
-        # "부의안건"보다 앞에서 가장 가까운 "주주총회 소집공고" 또는 "일 시" 등을 찾아
-        # 그 위치를 notice_start로 사용 (최대 8000자 역방향 탐색)
+        # 부의안건/목적사항 앞에서 소집공고 시작점을 역방향으로 탐색 (최대 8000자)
         search_window = full_text[max(0, agenda_pos - 8000): agenda_pos]
-        # 역방향에서 "주주총회 소집공고" 또는 "(제N기 정기)" 등 찾기
         back_patterns = [
             r'주\s*주\s*총\s*회\s*소\s*집\s*공\s*고',
             r'소\s*집\s*공\s*고',
@@ -319,15 +319,11 @@ def extract_text_sections(file_path):
         if best_back is not None:
             notice_start = max(0, agenda_pos - 8000) + best_back.start()
         else:
-            # 역방향 탐색 실패 → 부의안건 500자 앞부터
             notice_start = max(0, agenda_pos - 500)
     else:
-        # fallback: "주주총회 소집공고" 첫 번째 위치
-        for kw in ["주주총회 소집공고", "주주총회소집공고", "소 집 공 고"]:
-            idx = full_text.find(kw)
-            if idx != -1:
-                notice_start = idx
-                break
+        # ★ 넓은 범위 접근법: 모든 패턴 실패 → 문서 맨 앞부터 사용
+        # AI가 전체 문서를 읽고 안건 섹션을 직접 찾도록 함
+        notice_start = 0
 
     # ── 목적사항별 기재사항 섹션 시작점 찾기 ──
     section2_start = -1
@@ -340,7 +336,8 @@ def extract_text_sections(file_path):
             break
 
     if section2_start == -1:
-        notice_text = full_text[notice_start:notice_start + 8000]
+        # ★ 넓은 범위 접근법: section2가 없으면 notice_text를 더 길게 (최대 25000자)
+        notice_text = full_text[notice_start:notice_start + 25000]
         section2_text = ""
     else:
         notice_text = full_text[notice_start:section2_start]
@@ -365,19 +362,34 @@ def parse_and_analyze_with_ai(notice_text, corp_name, full_text_fallback=""):
     # notice_text가 너무 짧으면 full_text 앞부분으로 fallback
     text_to_use = notice_text
     if len(notice_text.strip()) < 300 and full_text_fallback:
-        text_to_use = full_text_fallback[:20000]
+        text_to_use = full_text_fallback[:25000]
 
-    # "부의안건" 위치를 찾아 그 앞 500자 + 이후 15000자를 우선 사용
-    # (notice_text 앞부분에 장소·일시 설명이 길어 의안 목록이 잘리는 것을 방지)
-    # ★ 정정공고는 비교표 안에도 "부의안건"이 등장하므로 마지막(가장 뒤) 위치 사용
+    # "부의안건" 또는 "목적사항" 위치를 찾아 그 앞 500자 + 이후 15000자를 우선 사용
+    # ★ 정정공고는 마지막(가장 뒤) 위치 사용
+    # ★ "회의 목적사항" 등 다양한 형태 포함
     import re as _re2
-    agenda_section_pat = _re2.compile(r'나\s*[\.．]\s*부의안건|나\.\s*부\s*의\s*안\s*건|부의\s*안건|[3-6]\s*\.\s*목\s*적\s*사\s*항')
+    agenda_section_pat = _re2.compile(
+        r'나\s*[\.．]\s*부의안건'
+        r'|나\.\s*부\s*의\s*안\s*건'
+        r'|부의\s*안건'
+        r'|[2-7]\s*[\.．]\s*[가-힣\s]{0,10}목\s*적\s*사\s*항'
+        r'|목\s*적\s*사\s*항'
+    )
     all_agenda_matches = list(agenda_section_pat.finditer(text_to_use))
     m = all_agenda_matches[-1] if all_agenda_matches else None
+
     if m and m.start() > 500:
-        # 부의안건 섹션 500자 앞부터 15000자
         slice_start = max(0, m.start() - 500)
         text_excerpt = text_to_use[slice_start: slice_start + 15000]
+    elif not m and full_text_fallback and text_to_use != full_text_fallback[:25000]:
+        # ★ 넓은 범위 접근법: text_to_use에서도 못 찾으면 full_text로 재시도
+        all_agenda_matches2 = list(agenda_section_pat.finditer(full_text_fallback))
+        m2 = all_agenda_matches2[-1] if all_agenda_matches2 else None
+        if m2:
+            slice_start = max(0, m2.start() - 500)
+            text_excerpt = full_text_fallback[slice_start: slice_start + 15000]
+        else:
+            text_excerpt = full_text_fallback[:25000]
     else:
         text_excerpt = text_to_use[:15000]
 
@@ -527,10 +539,11 @@ def get_agenda_content(content_map, agenda_num, agenda_title):
 def normalize_separate_election(text):
     """감사위원회 위원인 이사 분리선출 여부 → Y / N"""
     t = re.sub(r'[\s\u3000\xa0]+', '', str(text))
-    if not t or t in ['-', '—', '─', '–', '×']:
+    if not t or t in ['-', '—', '─', '–', '×', '해당없음']:
         return 'N'
-    negative_kws = ['아님', '미해당', '분리선출아님', '해당없음', '비해당', '해당사항없음', '×']
-    positive_kws = ['해당', '분리선출', '○', '예', 'Y']
+    # 부정어를 먼저 체크 ("분리선출아님" 같은 복합 표현 대응)
+    negative_kws = ['아님', '미해당', '분리선출아님', '해당없음', '비해당', '해당사항없음', '×', '않음', '불해당', '없음']
+    positive_kws = ['분리선출', '○', '예(Y)', '예', 'Y', '해당']
     for kw in negative_kws:
         if kw in t:
             return 'N'
@@ -578,10 +591,174 @@ def _build_logical_table(table_tag):
     ]
 
 
+def _grid_to_text(grid):
+    """논리적 그리드를 읽기 쉬운 텍스트 형식으로 변환 (AI 입력용)"""
+    return '\n'.join(' | '.join(row) for row in grid)
+
+
+def _extract_candidates_with_ai(table_text):
+    """
+    AI(Bedrock)를 사용해 후보자 정보 테이블 텍스트에서 구조화된 데이터를 추출.
+    HTML 테이블 구조가 복잡하거나 열 감지 실패 시 fallback으로 사용.
+    """
+    prompt = f"""다음은 주주총회 이사 선임 후보자 정보 테이블입니다. 각 후보자의 정보를 추출해주세요.
+
+테이블:
+{table_text}
+
+각 후보자(데이터 행)에 대해 다음 정보를 추출하세요:
+- 성명: 후보자 이름 (한국어 이름)
+- 사외이사여부: "사외이사", "사내이사", "기타비상무이사" 중 해당하는 것 (또는 테이블에 기재된 값 그대로)
+- 분리선출여부: 감사위원회 위원인 이사 분리선출 해당이면 "Y", 해당없으면 "N"
+  (○, 해당, 분리선출 → "Y" / ×, -, 해당없음, 아님, 비해당 → "N")
+- 주된직업: 현재 주된 직업 또는 직위
+
+반환 형식 (JSON only, 다른 설명 없음):
+{{
+  "이름": {{
+    "성명": "...",
+    "사외이사여부": "...",
+    "분리선출여부": "Y 또는 N",
+    "주된직업": "..."
+  }}
+}}
+
+주의사항:
+- 헤더 행(성명, 구분, 여부 등 열 제목이 있는 행)은 제외
+- 실제 후보자 데이터 행만 포함
+- 이름이 없거나 빈 행은 건너뜀"""
+
+    try:
+        result = call_bedrock(prompt, max_tokens=2000)
+        data = extract_json(result)
+        if not isinstance(data, dict):
+            return {}
+        candidates = {}
+        for name, info in data.items():
+            if not isinstance(info, dict):
+                continue
+            name_key = re.sub(r'\s+', '', name)
+            if not name_key or len(name_key) < 2:
+                continue
+            sep_val = normalize_separate_election(info.get("분리선출여부", "N"))
+            candidates[name_key] = {
+                "성명": info.get("성명", name),
+                "사외이사여부": info.get("사외이사여부", ""),
+                "분리선출여부": sep_val,
+                "주된직업": info.get("주된직업", ""),
+            }
+        return candidates
+    except Exception as e:
+        print(f"  [AI 후보자 추출 실패] {e}")
+        return {}
+
+
+def _detect_candidate_columns(grid):
+    """
+    논리적 그리드에서 후보자 정보 관련 열 인덱스를 탐지한다.
+
+    핵심 전략:
+    1. 각 열에 대해 모든 헤더 행의 텍스트를 누적(concat)하여 합성 헤더 생성
+       → 다중 행 헤더("사외이사" + "여부")를 단일 패턴으로 매칭 가능
+    2. 광범위한 동의어 패턴으로 매칭
+       → 회사마다 다른 열 이름 변형 처리
+
+    반환: (name_col, outside_col, separate_col, occupation_col, data_start_row)
+    모두 -1이면 감지 실패
+    """
+    if not grid:
+        return -1, -1, -1, -1, 0
+
+    n_cols = max(len(r) for r in grid)
+
+    # 헤더 행 판별: 주요 헤더 키워드가 있는 행 vs 실제 이름(한글 2~5자)이 첫 셀인 행
+    HEADER_KEYWORDS = {'후보자성명', '성명', '사외이사', '분리선출', '직업', '직위', '주된', '후보자'}
+    # 헤더 키워드로 쓰이는 단어들 — 첫 셀이 이것이면 이름이 아닌 헤더
+    HEADER_CELL_WORDS = {'후보자성명', '성명', '구분', '직위', '직업', '후보자', '이름'}
+    DATA_NAME_PAT = re.compile(r'^[가-힣]{2,5}$')
+
+    header_rows = []
+    data_start_row = 0
+    for row_idx, row in enumerate(grid):
+        row_clean = [re.sub(r'[\s\u3000\xa0]+', '', cell) for cell in row]
+        first_cell = row_clean[0] if row_clean else ''
+
+        # 행 전체 텍스트에 헤더 키워드가 있으면 헤더 행으로 판별
+        combined = ''.join(row_clean)
+        is_header = any(kw in combined for kw in HEADER_KEYWORDS)
+
+        if is_header:
+            header_rows.append(row_idx)
+            data_start_row = row_idx + 1
+            continue
+
+        # 첫 셀이 사람 이름처럼 보이면(한글 2~5자이고 헤더 단어가 아닌 경우) 데이터 행 → 스캔 종료
+        if DATA_NAME_PAT.match(first_cell) and first_cell not in HEADER_CELL_WORDS:
+            break
+
+    if not header_rows:
+        # fallback: 첫 행만 헤더로
+        header_rows = [0]
+        data_start_row = 1
+
+    # 각 열에 대해 헤더 행들의 텍스트를 누적한 합성 헤더 생성
+    combined_headers = []
+    for col_idx in range(n_cols):
+        parts = []
+        for row_idx in header_rows:
+            if col_idx < len(grid[row_idx]):
+                cell_text = re.sub(r'[\s\u3000\xa0(（）)\-·]+', '', grid[row_idx][col_idx])
+                if cell_text and cell_text not in parts:
+                    parts.append(cell_text)
+        combined_headers.append(''.join(parts))
+
+    name_col = outside_col = separate_col = occupation_col = -1
+
+    for col_idx, h in enumerate(combined_headers):
+        # 후보자성명
+        if name_col == -1 and ('후보자성명' in h or h == '성명'):
+            name_col = col_idx
+            continue
+        # 사외이사 여부 — 광범위한 동의어
+        if outside_col == -1 and col_idx != name_col:
+            if ('사외이사' in h and ('여부' in h or '후보자' in h)) or h in ('사외이사여부', '사외여부'):
+                outside_col = col_idx
+                continue
+        # 분리선출 여부
+        if separate_col == -1 and '분리선출' in h:
+            separate_col = col_idx
+            continue
+
+    # 주된직업 — 2단계 탐색 (강한 패턴 우선, 약한 패턴 fallback)
+    # 1차: "주된직업", "주요직업", "현재직위", "주요경력" 등 명확한 패턴
+    for col_idx, h in enumerate(combined_headers):
+        if col_idx in (name_col, outside_col, separate_col):
+            continue
+        if '주된직업' in h or '주요직업' in h or '현재직위' in h or '주요경력' in h:
+            occupation_col = col_idx
+            break
+    # 2차: "직업" 또는 "직위" 단독 (단, 감사/이사 관련 열 제외)
+    if occupation_col == -1:
+        for col_idx, h in enumerate(combined_headers):
+            if col_idx in (name_col, outside_col, separate_col):
+                continue
+            if '직업' in h or ('직위' in h and '감사' not in h and '이사' not in h):
+                occupation_col = col_idx
+                break
+
+    return name_col, outside_col, separate_col, occupation_col, data_start_row
+
+
 def extract_director_candidates_from_html(file_path):
     """
     HTML에서 이사 선임 후보자 정보 테이블을 파싱한다.
-    colspan/rowspan을 논리적 그리드로 처리하여 열 인덱스를 정확히 매칭.
+
+    처리 전략:
+    1. _build_logical_table()로 colspan/rowspan을 논리 그리드로 변환
+    2. _detect_candidate_columns()로 다중 행 헤더 합성 + 광범위 동의어 매칭으로 열 탐지
+    3. 탐지된 열로 데이터 행 파싱
+    4. 중요 필드(사외이사여부, 주된직업)가 비어 있으면 AI fallback으로 재추출
+
     반환: {후보자성명(공백제거): {"성명": ..., "사외이사여부": ..., "분리선출여부": ..., "주된직업": ...}}
     """
     try:
@@ -602,33 +779,13 @@ def extract_director_candidates_from_html(file_path):
         if not grid:
             continue
 
-        # 헤더 행들을 스캔해 열 인덱스 수집 (colspan/rowspan 처리 후이므로 정확)
-        name_col = outside_col = separate_col = occupation_col = -1
-        data_start_row = 0
-
-        for row_idx, row in enumerate(grid):
-            row_clean = [re.sub(r'[\s\u3000\xa0(（）)\-]+', '', cell) for cell in row]
-            found_header = False
-            for col_idx, h in enumerate(row_clean):
-                if '후보자성명' in h and name_col == -1:
-                    name_col = col_idx
-                    found_header = True
-                if ('사외이사후보자여부' in h or ('사외이사' in h and '여부' in h)) and outside_col == -1 and col_idx != name_col:
-                    outside_col = col_idx
-                    found_header = True
-                if '분리선출' in h and separate_col == -1:
-                    separate_col = col_idx
-                    found_header = True
-                if '주된직업' in h and occupation_col == -1:
-                    occupation_col = col_idx
-                    found_header = True
-            if found_header:
-                data_start_row = row_idx + 1
+        name_col, outside_col, separate_col, occupation_col, data_start_row = _detect_candidate_columns(grid)
 
         if name_col == -1:
             continue
 
         # 데이터 행 파싱
+        table_candidates = {}
         for row in grid[data_start_row:]:
             if len(row) <= name_col:
                 continue
@@ -636,20 +793,77 @@ def extract_director_candidates_from_html(file_path):
             name_key = re.sub(r'\s+', '', name_raw)
             if not name_key or len(name_key) < 2:
                 continue
-            if '후보자성명' in name_key or name_key == '성명':
-                continue  # 헤더 재등장 건너뜀
+            # 헤더 텍스트가 재등장하면 건너뜀
+            if any(kw in name_key for kw in ['후보자성명', '성명', '이사', '감사', '후보자']):
+                if not re.match(r'^[가-힣]{2,5}$', name_key):
+                    continue
 
-            outside_val = row[outside_col].strip() if outside_col >= 0 and outside_col < len(row) else ""
-            sep_raw = row[separate_col].strip() if separate_col >= 0 and separate_col < len(row) else ""
+            outside_val = row[outside_col].strip() if 0 <= outside_col < len(row) else ""
+            sep_raw = row[separate_col].strip() if 0 <= separate_col < len(row) else ""
             sep_val = normalize_separate_election(sep_raw)
-            occ_val = row[occupation_col].strip() if occupation_col >= 0 and occupation_col < len(row) else ""
+            occ_val = row[occupation_col].strip() if 0 <= occupation_col < len(row) else ""
 
-            candidates[name_key] = {
+            table_candidates[name_key] = {
                 "성명": name_raw,
                 "사외이사여부": outside_val,
                 "분리선출여부": sep_val,
                 "주된직업": occ_val,
             }
+
+        # 사외이사여부 유효값 집합 (이 값이 아니면 열 탐지가 잘못된 것)
+        VALID_OUTSIDE_VALS = {
+            '사외이사', '사내이사', '기타비상무이사', '사외', '사내',
+            '해당', '미해당', '○', '×', 'O', 'X', 'Y', 'N',
+            '사외이사해당', '사외이사미해당', '사내이사해당안됨',
+        }
+
+        def _is_valid_outside(val):
+            """사외이사여부 열에서 나올 법한 값인지 의미론적으로 검증.
+            '해당사항없음', '해당없음' 등 N/A 표시는 잘못된 열을 읽은 것으로 판단.
+            """
+            if not val:
+                return False
+            v = re.sub(r'[\s\u3000\xa0]+', '', val)
+            if not v or v in ['-', '—', '─', '–']:
+                return True  # 대시 계열은 "해당없음"으로 허용
+            # N/A 표시 → 잘못된 열
+            if '없음' in v or '해당사항' in v:
+                return False
+            # 단독 기호(○/×/O/X/Y/N)도 유효
+            if v in ['○', '×', 'O', 'X', 'Y', 'N']:
+                return True
+            # 사외이사 구분에 쓰이는 실제 값 패턴
+            return any(kw in v for kw in ['사외이사', '사내이사', '비상무', '미해당', '해당'])
+
+        # AI fallback 조건:
+        # 1) HTML 파싱으로 후보자를 전혀 못 찾은 경우
+        # 2) 사외이사여부가 비어있거나 의미론적으로 잘못된 값인 경우 (열 탐지 실패)
+        # 3) 주된직업 열 자체를 탐지 못했고(occupation_col==-1) 후보자가 있는 경우
+        needs_ai = (
+            not table_candidates
+            or any(not _is_valid_outside(v["사외이사여부"]) for v in table_candidates.values())
+            or (occupation_col == -1 and bool(table_candidates))
+        )
+
+        if needs_ai:
+            table_text = _grid_to_text(grid)
+            ai_result = _extract_candidates_with_ai(table_text)
+            for name_key, ai_info in ai_result.items():
+                if name_key not in table_candidates:
+                    table_candidates[name_key] = ai_info
+                else:
+                    existing = table_candidates[name_key]
+                    # 사외이사여부: AI 결과가 유효하면 교체 (기존 값이 잘못됐을 수 있음)
+                    if ai_info.get("사외이사여부") and _is_valid_outside(ai_info["사외이사여부"]):
+                        existing["사외이사여부"] = ai_info["사외이사여부"]
+                    # 주된직업: 비어있으면 AI로 채움
+                    if not existing["주된직업"] and ai_info.get("주된직업"):
+                        existing["주된직업"] = ai_info["주된직업"]
+                    # 분리선출: AI가 Y라고 판단하고 HTML 파싱이 N이면 AI 우선
+                    if ai_info.get("분리선출여부") == "Y" and existing["분리선출여부"] == "N":
+                        existing["분리선출여부"] = "Y"
+
+        candidates.update(table_candidates)
 
     return candidates
 
@@ -1421,7 +1635,188 @@ def agenda_sort_key(num_str):
 
 
 # ─────────────────────────────────────────────
-# 6. 메인
+# 6. 주주총회결과 보고서 처리
+# ─────────────────────────────────────────────
+
+def normalize_num_for_match(num_str):
+    """안건번호를 매칭용 정규화 키로 변환.
+    '제2-1호 의안' → '2-1', '1' → '1', '제3호' → '3'
+    """
+    s = re.sub(r'\s+', '', str(num_str))
+    # "제N호의안" / "제N-M호" 형태에서 숫자-숫자 부분만 추출
+    m = re.search(r'제([\d][\d\-]*[\d]?)호', s)
+    if m:
+        return m.group(1)
+    # 이미 "1", "2-1", "2-1-1" 형태
+    m2 = re.match(r'^([\d]+(?:-[\d]+)*)$', s)
+    if m2:
+        return m2.group(1)
+    return s
+
+
+def fetch_agm_result_rcept_no(corp_code, bgn_de, end_de):
+    """
+    corp_code로 DART에서 정기주주총회결과 보고서를 검색하여 rcept_no를 반환한다.
+    여러 건이 있으면 가장 최신(rcept_no 최대값) 반환.
+    """
+    url = "https://opendart.fss.or.kr/api/list.json"
+    params = {
+        "crtfc_key": API_KEY,
+        "corp_code": corp_code,
+        "bgn_de": bgn_de,
+        "end_de": end_de,
+        "page_count": 20,
+        "sort": "date",
+        "sort_mth": "desc",
+    }
+    try:
+        res = safe_get(url, params)
+        data = res.json()
+        if data.get("status") != "000":
+            return ""
+        best = ""
+        for item in data.get("list", []):
+            report_nm = str(item.get("report_nm", ""))
+            if "주주총회결과" in report_nm:
+                rno = str(item.get("rcept_no", ""))
+                if rno > best:
+                    best = rno
+        return best
+    except Exception as e:
+        print(f"  [결과보고서 검색 실패] {corp_code}: {e}")
+    return ""
+
+
+def extract_agm_result_table(file_path):
+    """
+    정기주주총회결과 HTML에서 '주주총회 안건 세부내역' 표를 파싱한다.
+    반환: {정규화번호: {"결의구분":, "회의목적사항":, "가결여부":,
+                       "찬성률1":, "찬성률2":, "반대율":, "비고":}}
+    """
+    empty = {}
+    try:
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+        soup = BeautifulSoup(content, 'lxml')
+    except Exception:
+        return empty
+
+    result = {}
+
+    for table in soup.find_all('table'):
+        table_text_nsp = re.sub(r'\s+', '', table.get_text())
+        # "가결여부" + "결의구분" 또는 "회의목적사항" 을 포함하는 테이블만 처리
+        if '가결여부' not in table_text_nsp:
+            continue
+        if '결의구분' not in table_text_nsp and '회의목적사항' not in table_text_nsp:
+            continue
+
+        grid = _build_logical_table(table)
+        if not grid or len(grid) < 2:
+            continue
+
+        # 헤더 행 식별 (번호/결의구분/가결여부 등 포함 행)
+        HEADER_KWS = {'번호', '결의구분', '가결여부', '회의목적사항', '찬성', '반대', '비고'}
+        header_rows = []
+        data_start = 0
+        for row_idx, row in enumerate(grid):
+            combined = re.sub(r'\s+', '', ''.join(row))
+            if any(kw in combined for kw in HEADER_KWS):
+                # 실제 숫자 데이터 행이 아닌 경우만 헤더로
+                first = re.sub(r'\s+', '', row[0]) if row else ''
+                if not re.match(r'^\d', first):
+                    header_rows.append(row_idx)
+                    data_start = row_idx + 1
+
+        if not header_rows:
+            continue
+
+        # 열별 합성 헤더 생성 (다중 행 헤더 대응)
+        n_cols = max(len(r) for r in grid)
+        combined_headers = []
+        for col_idx in range(n_cols):
+            parts = []
+            for row_idx in header_rows:
+                if col_idx < len(grid[row_idx]):
+                    t = re.sub(r'[\s\u3000\xa0\(\)①②③④⑤]+', '', grid[row_idx][col_idx])
+                    if t and t not in parts:
+                        parts.append(t)
+            combined_headers.append(''.join(parts))
+
+        # 각 열 인덱스 탐지
+        def _find_col(keywords, exclude=()):
+            for i, h in enumerate(combined_headers):
+                if i in exclude:
+                    continue
+                if any(kw in h for kw in keywords):
+                    return i
+            return -1
+
+        num_col = _find_col(['번호'])
+        category_col = _find_col(['결의구분'], exclude=(num_col,))
+        title_col = _find_col(['회의목적사항', '목적사항'], exclude=(num_col, category_col))
+        pass_col = _find_col(['가결여부'], exclude=(num_col, category_col, title_col))
+
+        # 찬성률(1): 발행/발생주식총수 기준
+        rate1_col = -1
+        for i, h in enumerate(combined_headers):
+            if i in (num_col, category_col, title_col, pass_col):
+                continue
+            if ('발행주식' in h or '발생주식' in h) and '찬성' in h:
+                rate1_col = i; break
+        if rate1_col == -1:  # fallback: 첫 번째 찬성 열
+            rate1_col = _find_col(['찬성'], exclude=(num_col, category_col, title_col, pass_col))
+
+        # (1)중 의결권 행사 기준 찬성률
+        rate2_col = _find_col(['의결권', '찬성'],
+                               exclude=(num_col, category_col, title_col, pass_col, rate1_col))
+        if rate2_col == -1:
+            # fallback: rate1_col 다음에 오는 찬성 열
+            for i, h in enumerate(combined_headers):
+                if i in (num_col, category_col, title_col, pass_col, rate1_col):
+                    continue
+                if '찬성' in h or '%' in h:
+                    rate2_col = i; break
+
+        # 반대·기관 비율
+        against_col = _find_col(['반대', '기관'],
+                                  exclude=(num_col, category_col, title_col, pass_col,
+                                           rate1_col, rate2_col))
+
+        note_col = _find_col(['비고'], exclude=(num_col,))
+
+        if num_col == -1:
+            continue
+
+        # 데이터 행 파싱
+        for row in grid[data_start:]:
+            if len(row) <= num_col:
+                continue
+            num_raw = row[num_col].strip()
+            if not num_raw or not re.search(r'\d', num_raw):
+                continue
+            num_key = normalize_num_for_match(num_raw)
+            if not num_key:
+                continue
+
+            def _get(col):
+                return row[col].strip() if 0 <= col < len(row) else ""
+
+            result[num_key] = {
+                "결의구분":    _get(category_col),
+                "회의목적사항": _get(title_col),
+                "가결여부":    _get(pass_col),
+                "찬성률1":    _get(rate1_col),
+                "찬성률2":    _get(rate2_col),
+                "반대율":     _get(against_col),
+                "비고":       _get(note_col),
+            }
+
+    return result
+
+
+# ─────────────────────────────────────────────
+# 7. 메인
 # ─────────────────────────────────────────────
 
 def main():
@@ -1478,6 +1873,7 @@ def main():
         rcept_no = str(report.get("rcept_no", ""))
         corp_cls = str(report.get("corp_cls", ""))
         rcept_dt = str(report.get("rcept_dt", ""))
+        corp_code = str(report.get("corp_code", ""))
 
         market_label = ""
         if corp_cls == "Y":
@@ -1680,6 +2076,7 @@ def main():
                     "[전기보수] 최고한도액": 전기_최고한도,
                     "[자사주승인]": 자사주승인_내용,
                     "_charter_key": num_clean if category1 == "정관변경" else "",
+                    "_corp_code": corp_code,
                 })
 
         except Exception as e:
@@ -1693,6 +2090,77 @@ def main():
     # 내부 추적용 _charter_key 열 제거
     for row in all_rows:
         row.pop("_charter_key", None)
+
+    # ── 주주총회결과 보고서 fetch & 매칭 ──
+    # 결과보고서는 소집공고 기간 이후에 올라오므로 +90일 범위로 검색
+    result_end_date = (datetime.strptime(end_date, "%Y%m%d") + timedelta(days=90)).strftime("%Y%m%d")
+    result_start_date = start_date  # 소집공고 시작일부터
+
+    write_progress(progress_file, "running", 96, "주주총회결과 보고서 검색 중...")
+
+    # 회사별 결과 테이블 수집 (corp_code → {num_key → result_data})
+    corp_result_map = {}
+    seen_corp_codes = {}  # corp_code → corp_name (중복 fetch 방지)
+    for row in all_rows:
+        cc = row.get("_corp_code", "")
+        cn = row.get("회사명", "")
+        if cc and cc not in seen_corp_codes:
+            seen_corp_codes[cc] = cn
+
+    for corp_code_r, corp_name_r in seen_corp_codes.items():
+        result_rcept = fetch_agm_result_rcept_no(corp_code_r, result_start_date, result_end_date)
+        if not result_rcept:
+            continue
+        rfolder = download_report(result_rcept)
+        if not rfolder:
+            continue
+        rfile = find_main_file(rfolder)
+        if rfile:
+            corp_result_map[corp_code_r] = extract_agm_result_table(rfile)
+            if not corp_result_map[corp_code_r]:
+                print(f"  [결과표 파싱 실패] {corp_name_r}")
+        shutil.rmtree(rfolder, ignore_errors=True)
+        time.sleep(0.08)
+
+    # [결과] 열 데이터를 각 행에 매핑
+    RESULT_COL_NAMES = [
+        "[결과] 번호",
+        "[결과] 결의구분",
+        "[결과] 회의목적사항",
+        "[결과] 가결여부",
+        "[결과] 발생주식총수 기준 찬성률(1)",
+        "[결과] (1)중 의결권 행사 주식수 기준 찬성률",
+        "[결과] (1)중 의결권 행사 주식수 기준 반대·기관 등 비율(%)",
+        "[결과] 비고",
+    ]
+    RESULT_FIELD_MAP = {  # 열 이름 → extract_agm_result_table 반환 키
+        "[결과] 번호":                                    None,  # 안건번호 자체
+        "[결과] 결의구분":                                "결의구분",
+        "[결과] 회의목적사항":                            "회의목적사항",
+        "[결과] 가결여부":                                "가결여부",
+        "[결과] 발생주식총수 기준 찬성률(1)":              "찬성률1",
+        "[결과] (1)중 의결권 행사 주식수 기준 찬성률":      "찬성률2",
+        "[결과] (1)중 의결권 행사 주식수 기준 반대·기관 등 비율(%)": "반대율",
+        "[결과] 비고":                                    "비고",
+    }
+
+    for row in all_rows:
+        cc = row.get("_corp_code", "")
+        agenda_num_str = row.get("안건번호", "")
+        num_key = normalize_num_for_match(agenda_num_str)
+        result_data = corp_result_map.get(cc, {}).get(num_key, {})
+
+        for col_name in RESULT_COL_NAMES:
+            field = RESULT_FIELD_MAP[col_name]
+            if field is None:
+                # [결과] 번호: 결과 테이블에서 찾은 번호 그대로 (없으면 빈 값)
+                row[col_name] = num_key if result_data else ""
+            else:
+                row[col_name] = result_data.get(field, "")
+
+    # 내부 추적용 _corp_code 열 제거
+    for row in all_rows:
+        row.pop("_corp_code", None)
 
     result_df = pd.DataFrame(all_rows)
     fail_df = pd.DataFrame(fail_list, columns=["corp_name", "stock_code", "rcept_no", "reason"])
