@@ -4,7 +4,9 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 import subprocess
 import os
+import sys
 import uuid
+from pathlib import Path
 import json
 import threading
 import time
@@ -18,13 +20,9 @@ from urllib3.util.retry import Retry
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # startup: 회사명 캐시 로드
-    ensure_company_cache_loaded()
-    if company_cache.get("source") in ("file", "local_xml"):
-        t = threading.Thread(target=refresh_company_cache_in_background, daemon=True)
-        t.start()
+    # App Runner 배포 안정성을 위해 startup에서는 무거운 I/O를 하지 않는다.
+    # 회사 캐시는 첫 요청에서 lazy-load 된다.
     yield
-    # shutdown: 별도 정리 불필요
 
 
 app = FastAPI(lifespan=lifespan)
@@ -32,8 +30,9 @@ app = FastAPI(lifespan=lifespan)
 API_KEY = os.getenv("DART_API_KEY")
 jobs = {}
 
-COMPANY_CACHE_FILE = "company_names.json"
-LOCAL_CORP_XML = "corp_data/CORPCODE.xml"
+BASE_DIR = Path(__file__).resolve().parent
+COMPANY_CACHE_FILE = str(BASE_DIR / "company_names.json")
+LOCAL_CORP_XML = str(BASE_DIR / "corp_data" / "CORPCODE.xml")
 
 company_cache = {
     "loaded_at": 0,
@@ -200,12 +199,12 @@ def monitor_process(job_id, proc):
 
 @app.get("/")
 def root():
-    return FileResponse("index.html")
+    return FileResponse(str(BASE_DIR / "index.html"))
 
 
 @app.get("/page")
 def page():
-    return FileResponse("index.html")
+    return FileResponse(str(BASE_DIR / "index.html"))
 
 
 @app.get("/health")
@@ -219,6 +218,18 @@ def env_check():
     return {
         "has_key": bool(value),
         "prefix": value[:5] if value else None
+    }
+
+
+
+
+@app.get("/startup-debug")
+def startup_debug():
+    return {
+        "base_dir": str(BASE_DIR),
+        "index_exists": (BASE_DIR / "index.html").exists(),
+        "corp_xml_exists": Path(LOCAL_CORP_XML).exists(),
+        "python": sys.executable,
     }
 
 
@@ -251,12 +262,12 @@ def company_suggestions(q: str = Query(...)):
 @app.post("/start-download")
 def start_download(payload: DownloadRequest):
     job_id = str(uuid.uuid4())[:8]
-    output_file = f"filtered_result_{job_id}.xlsx"
-    progress_file = f"progress_{job_id}.json"
+    output_file = str(BASE_DIR / f"filtered_result_{job_id}.xlsx")
+    progress_file = str(BASE_DIR / f"progress_{job_id}.json")
 
     args = [
-        "python3",
-        "generate_filtered_excel.py",
+        sys.executable,
+        str(BASE_DIR / "generate_filtered_excel.py"),
         "--start-date", payload.start_date,
         "--end-date", payload.end_date,
         "--companies-json", json.dumps(payload.companies, ensure_ascii=False),
@@ -290,12 +301,12 @@ def start_download(payload: DownloadRequest):
 @app.post("/start-regular-download")
 def start_regular_download(payload: DownloadRequest):
     job_id = str(uuid.uuid4())[:8]
-    output_file = f"regular_meeting_result_{job_id}.xlsx"
-    progress_file = f"progress_regular_{job_id}.json"
+    output_file = str(BASE_DIR / f"regular_meeting_result_{job_id}.xlsx")
+    progress_file = str(BASE_DIR / f"progress_regular_{job_id}.json")
 
     args = [
-        "python3",
-        "generate_regular_meeting_excel.py",
+        sys.executable,
+        str(BASE_DIR / "generate_regular_meeting_excel.py"),
         "--start-date", payload.start_date,
         "--end-date", payload.end_date,
         "--companies-json", json.dumps(payload.companies, ensure_ascii=False),
@@ -387,12 +398,12 @@ def job_status(job_id: str):
 @app.post("/start-agm-notice-download")
 def start_agm_notice_download(payload: DownloadRequest):
     job_id = str(uuid.uuid4())[:8]
-    output_file = f"agm_notice_result_{job_id}.xlsx"
-    progress_file = f"progress_agm_{job_id}.json"
+    output_file = str(BASE_DIR / f"agm_notice_result_{job_id}.xlsx")
+    progress_file = str(BASE_DIR / f"progress_agm_{job_id}.json")
 
     args = [
-        "python3",
-        "generate_agm_notice_excel.py",
+        sys.executable,
+        str(BASE_DIR / "generate_agm_notice_excel.py"),
         "--start-date", payload.start_date,
         "--end-date", payload.end_date,
         "--companies-json", json.dumps(payload.companies, ensure_ascii=False),
@@ -426,12 +437,12 @@ def start_agm_notice_download(payload: DownloadRequest):
 @app.post("/start-kind-download")
 def start_kind_download(payload: KindDownloadRequest):
     job_id = str(uuid.uuid4())[:8]
-    output_file = f"kind_institution_result_{job_id}.xlsx"
-    progress_file = f"progress_kind_{job_id}.json"
+    output_file = str(BASE_DIR / f"kind_institution_result_{job_id}.xlsx")
+    progress_file = str(BASE_DIR / f"progress_kind_{job_id}.json")
 
     args = [
-        "python3",
-        "generate_kind_institution_excel.py",
+        sys.executable,
+        str(BASE_DIR / "generate_kind_institution_excel.py"),
         "--start-date", payload.start_date,
         "--end-date", payload.end_date,
         "--output", output_file,
@@ -473,6 +484,6 @@ def download_file(job_id: str):
 
     return FileResponse(
         path=output_file,
-        filename=output_file,
+        filename=os.path.basename(output_file),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
