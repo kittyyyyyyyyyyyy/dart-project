@@ -1,4 +1,3 @@
-from contextlib import asynccontextmanager
 from fastapi import FastAPI, Query
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
@@ -6,7 +5,6 @@ import subprocess
 import os
 import sys
 import uuid
-from pathlib import Path
 import json
 import threading
 import time
@@ -14,31 +12,29 @@ import requests
 import zipfile
 import io
 import xml.etree.ElementTree as ET
+from pathlib import Path
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+BASE_DIR = Path(__file__).resolve().parent
+RUNTIME_DIR = BASE_DIR / "runtime_data"
+RUNTIME_DIR.mkdir(exist_ok=True)
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # App Runner 배포 안정성을 위해 startup에서는 무거운 I/O를 하지 않는다.
-    # 회사 캐시는 첫 요청에서 lazy-load 된다.
-    yield
-
-
-app = FastAPI(lifespan=lifespan)
+app = FastAPI()
 
 API_KEY = os.getenv("DART_API_KEY")
 jobs = {}
 
-BASE_DIR = Path(__file__).resolve().parent
-COMPANY_CACHE_FILE = str(BASE_DIR / "company_names.json")
-LOCAL_CORP_XML = str(BASE_DIR / "corp_data" / "CORPCODE.xml")
+COMPANY_CACHE_FILE = RUNTIME_DIR / "company_names.json"
+LOCAL_CORP_XML = BASE_DIR / "corp_data" / "CORPCODE.xml"
+INDEX_HTML = BASE_DIR / "index.html"
 
 company_cache = {
     "loaded_at": 0,
     "names": [],
-    "source": None   # "memory" | "file" | "local_xml" | "dart"
+    "source": None
 }
+_company_lock = threading.Lock()
 
 
 def make_session():
@@ -61,29 +57,23 @@ http = make_session()
 
 
 def save_company_names_to_file(names):
-    with open(COMPANY_CACHE_FILE, "w", encoding="utf-8") as f:
-        json.dump(names, f, ensure_ascii=False)
+    COMPANY_CACHE_FILE.write_text(json.dumps(names, ensure_ascii=False), encoding="utf-8")
 
 
 def load_company_names_from_file():
-    if not os.path.exists(COMPANY_CACHE_FILE):
+    if not COMPANY_CACHE_FILE.exists():
         return []
     try:
-        with open(COMPANY_CACHE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+        return json.loads(COMPANY_CACHE_FILE.read_text(encoding="utf-8"))
     except Exception:
         return []
 
 
 def load_company_names_from_local_xml():
-    """
-    레포에 포함된 corp_data/CORPCODE.xml을 파싱해 회사명 목록을 반환한다.
-    DART API 호출 없이 즉시 로드 가능해 서버 시작 속도를 크게 개선한다.
-    """
-    if not os.path.exists(LOCAL_CORP_XML):
+    if not LOCAL_CORP_XML.exists():
         return []
     try:
-        tree = ET.parse(LOCAL_CORP_XML)
+        tree = ET.parse(str(LOCAL_CORP_XML))
         root = tree.getroot()
         names = set()
         for item in root.findall("list"):
@@ -106,12 +96,11 @@ def fetch_company_names_from_dart():
     url = "https://opendart.fss.or.kr/api/corpCode.xml"
     params = {"crtfc_key": API_KEY}
 
-    res = http.get(url, params=params, timeout=(60, 180))
+    res = http.get(url, params=params, timeout=(20, 120))
+    res.raise_for_status()
     z = zipfile.ZipFile(io.BytesIO(res.content))
-
     xml_filename = z.namelist()[0]
     xml_content = z.read(xml_filename)
-
     root = ET.fromstring(xml_content)
 
     names = set()
@@ -128,54 +117,38 @@ def ensure_company_cache_loaded():
     if company_cache["names"]:
         return company_cache["names"]
 
-    # 1순위: company_names.json 파일 (이전 실행에서 저장된 최신 목록)
-    file_names = load_company_names_from_file()
-    if file_names:
-        company_cache["names"] = file_names
-        company_cache["loaded_at"] = time.time()
-        company_cache["source"] = "file"
-        return file_names
+    with _company_lock:
+        if company_cache["names"]:
+            return company_cache["names"]
 
-    # 2순위: 레포에 포함된 로컬 CORPCODE.xml (DART API 불필요, 빠름)
-    xml_names = load_company_names_from_local_xml()
-    if xml_names:
-        company_cache["names"] = xml_names
-        company_cache["loaded_at"] = time.time()
-        company_cache["source"] = "local_xml"
-        save_company_names_to_file(xml_names)
-        return xml_names
+        file_names = load_company_names_from_file()
+        if file_names:
+            company_cache["names"] = file_names
+            company_cache["loaded_at"] = time.time()
+            company_cache["source"] = "file"
+            return file_names
 
-    # 3순위: DART API 직접 호출 (느림, 최후 수단)
-    try:
-        names = fetch_company_names_from_dart()
-        company_cache["names"] = names
-        company_cache["loaded_at"] = time.time()
-        company_cache["source"] = "dart"
-        save_company_names_to_file(names)
-        return names
-    except Exception as e:
-        print("회사명 목록 초기 로드 실패:", str(e))
-        return []
+        xml_names = load_company_names_from_local_xml()
+        if xml_names:
+            company_cache["names"] = xml_names
+            company_cache["loaded_at"] = time.time()
+            company_cache["source"] = "local_xml"
+            try:
+                save_company_names_to_file(xml_names)
+            except Exception as e:
+                print("회사명 캐시 파일 저장 실패:", e)
+            return xml_names
 
-
-def refresh_company_cache_in_background():
-    """
-    DART API에서 최신 회사 목록을 받아 캐시를 갱신한다.
-    로컬 XML이나 파일로 로드된 경우 백그라운드에서 최신화한다.
-    """
-    try:
-        names = fetch_company_names_from_dart()
-        if names:
+        try:
+            names = fetch_company_names_from_dart()
             company_cache["names"] = names
             company_cache["loaded_at"] = time.time()
             company_cache["source"] = "dart"
             save_company_names_to_file(names)
-            print(f"회사명 캐시 갱신 완료: {len(names)}개")
-    except Exception as e:
-        print("회사명 캐시 백그라운드 갱신 실패:", str(e))
-
-
-# startup logic은 lifespan 컨텍스트 매니저로 이동 (파일 상단 참조)
+            return names
+        except Exception as e:
+            print("회사명 목록 초기 로드 실패:", str(e))
+            return []
 
 
 class DownloadRequest(BaseModel):
@@ -197,14 +170,44 @@ def monitor_process(job_id, proc):
     jobs[job_id]["finished_at"] = time.time()
 
 
+def _script_path(name: str) -> str:
+    return str(BASE_DIR / name)
+
+
+def _job_file(name: str) -> str:
+    return str(RUNTIME_DIR / name)
+
+
+def _start_job(job_id: str, args: list[str], output_file: str, progress_file: str):
+    proc = subprocess.Popen(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=str(BASE_DIR)
+    )
+    jobs[job_id] = {
+        "process": proc,
+        "output_file": output_file,
+        "progress_file": progress_file,
+        "stdout": "",
+        "stderr": "",
+        "returncode": None,
+        "created_at": time.time()
+    }
+    t = threading.Thread(target=monitor_process, args=(job_id, proc), daemon=True)
+    t.start()
+    return {"job_id": job_id}
+
+
 @app.get("/")
 def root():
-    return FileResponse(str(BASE_DIR / "index.html"))
+    return FileResponse(str(INDEX_HTML))
 
 
 @app.get("/page")
 def page():
-    return FileResponse(str(BASE_DIR / "index.html"))
+    return FileResponse(str(INDEX_HTML))
 
 
 @app.get("/health")
@@ -212,25 +215,22 @@ def health():
     return {"message": "server running"}
 
 
-@app.get("/env-check")
-def env_check():
-    value = os.getenv("DART_API_KEY")
-    return {
-        "has_key": bool(value),
-        "prefix": value[:5] if value else None
-    }
-
-
-
-
 @app.get("/startup-debug")
 def startup_debug():
     return {
         "base_dir": str(BASE_DIR),
-        "index_exists": (BASE_DIR / "index.html").exists(),
-        "corp_xml_exists": Path(LOCAL_CORP_XML).exists(),
+        "cwd": os.getcwd(),
+        "index_exists": INDEX_HTML.exists(),
+        "corp_xml_exists": LOCAL_CORP_XML.exists(),
+        "runtime_dir_exists": RUNTIME_DIR.exists(),
         "python": sys.executable,
     }
+
+
+@app.get("/env-check")
+def env_check():
+    value = os.getenv("DART_API_KEY")
+    return {"has_key": bool(value), "prefix": value[:5] if value else None}
 
 
 @app.get("/company-suggestions")
@@ -244,14 +244,12 @@ def company_suggestions(q: str = Query(...)):
 
     starts = []
     contains = []
-
     for name in all_names:
         lower_name = name.lower()
         if lower_name.startswith(q_lower):
             starts.append(name)
         elif q_lower in lower_name:
             contains.append(name)
-
         if len(starts) + len(contains) >= 20:
             break
 
@@ -262,79 +260,68 @@ def company_suggestions(q: str = Query(...)):
 @app.post("/start-download")
 def start_download(payload: DownloadRequest):
     job_id = str(uuid.uuid4())[:8]
-    output_file = str(BASE_DIR / f"filtered_result_{job_id}.xlsx")
-    progress_file = str(BASE_DIR / f"progress_{job_id}.json")
-
+    output_file = _job_file(f"filtered_result_{job_id}.xlsx")
+    progress_file = _job_file(f"progress_{job_id}.json")
     args = [
         sys.executable,
-        str(BASE_DIR / "generate_filtered_excel.py"),
+        _script_path("generate_filtered_excel.py"),
         "--start-date", payload.start_date,
         "--end-date", payload.end_date,
         "--companies-json", json.dumps(payload.companies, ensure_ascii=False),
         "--output", output_file,
-        "--progress-file", progress_file
+        "--progress-file", progress_file,
     ]
-
-    proc = subprocess.Popen(
-        args,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True
-    )
-
-    jobs[job_id] = {
-        "process": proc,
-        "output_file": output_file,
-        "progress_file": progress_file,
-        "stdout": "",
-        "stderr": "",
-        "returncode": None,
-        "created_at": time.time()
-    }
-
-    t = threading.Thread(target=monitor_process, args=(job_id, proc), daemon=True)
-    t.start()
-
-    return {"job_id": job_id}
+    return _start_job(job_id, args, output_file, progress_file)
 
 
 @app.post("/start-regular-download")
 def start_regular_download(payload: DownloadRequest):
     job_id = str(uuid.uuid4())[:8]
-    output_file = str(BASE_DIR / f"regular_meeting_result_{job_id}.xlsx")
-    progress_file = str(BASE_DIR / f"progress_regular_{job_id}.json")
-
+    output_file = _job_file(f"regular_meeting_result_{job_id}.xlsx")
+    progress_file = _job_file(f"progress_regular_{job_id}.json")
     args = [
         sys.executable,
-        str(BASE_DIR / "generate_regular_meeting_excel.py"),
+        _script_path("generate_regular_meeting_excel.py"),
         "--start-date", payload.start_date,
         "--end-date", payload.end_date,
         "--companies-json", json.dumps(payload.companies, ensure_ascii=False),
         "--output", output_file,
-        "--progress-file", progress_file
+        "--progress-file", progress_file,
     ]
+    return _start_job(job_id, args, output_file, progress_file)
 
-    proc = subprocess.Popen(
-        args,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True
-    )
 
-    jobs[job_id] = {
-        "process": proc,
-        "output_file": output_file,
-        "progress_file": progress_file,
-        "stdout": "",
-        "stderr": "",
-        "returncode": None,
-        "created_at": time.time()
-    }
+@app.post("/start-agm-notice-download")
+def start_agm_notice_download(payload: DownloadRequest):
+    job_id = str(uuid.uuid4())[:8]
+    output_file = _job_file(f"agm_notice_result_{job_id}.xlsx")
+    progress_file = _job_file(f"progress_agm_{job_id}.json")
+    args = [
+        sys.executable,
+        _script_path("generate_agm_notice_excel.py"),
+        "--start-date", payload.start_date,
+        "--end-date", payload.end_date,
+        "--companies-json", json.dumps(payload.companies, ensure_ascii=False),
+        "--output", output_file,
+        "--progress-file", progress_file,
+    ]
+    return _start_job(job_id, args, output_file, progress_file)
 
-    t = threading.Thread(target=monitor_process, args=(job_id, proc), daemon=True)
-    t.start()
 
-    return {"job_id": job_id}
+@app.post("/start-kind-download")
+def start_kind_download(payload: KindDownloadRequest):
+    job_id = str(uuid.uuid4())[:8]
+    output_file = _job_file(f"kind_institution_result_{job_id}.xlsx")
+    progress_file = _job_file(f"progress_kind_{job_id}.json")
+    args = [
+        sys.executable,
+        _script_path("generate_kind_institution_excel.py"),
+        "--start-date", payload.start_date,
+        "--end-date", payload.end_date,
+        "--output", output_file,
+        "--progress-file", progress_file,
+    ]
+    return _start_job(job_id, args, output_file, progress_file)
 
 
 @app.get("/job-status/{job_id}")
@@ -349,7 +336,7 @@ def job_status(job_id: str):
         "percent": 0,
         "message": "작업 준비 중...",
         "current": 0,
-        "total": 0
+        "total": 0,
     }
 
     if os.path.exists(job["progress_file"]):
@@ -368,7 +355,7 @@ def job_status(job_id: str):
             "state": "error",
             "progress": progress,
             "stdout": job["stdout"],
-            "stderr": job["stderr"]
+            "stderr": job["stderr"],
         }
 
     if os.path.exists(job["output_file"]):
@@ -380,9 +367,9 @@ def job_status(job_id: str):
                 "percent": 100,
                 "message": "엑셀 생성 완료",
                 "current": progress.get("current", 0),
-                "total": progress.get("total", 0)
+                "total": progress.get("total", 0),
             },
-            "download_url": f"/download-file/{job_id}"
+            "download_url": f"/download-file/{job_id}",
         }
 
     return {
@@ -391,85 +378,8 @@ def job_status(job_id: str):
         "progress": progress,
         "stdout": job["stdout"],
         "stderr": job["stderr"],
-        "error": "엑셀 파일을 찾을 수 없습니다."
+        "error": "엑셀 파일을 찾을 수 없습니다.",
     }
-
-
-@app.post("/start-agm-notice-download")
-def start_agm_notice_download(payload: DownloadRequest):
-    job_id = str(uuid.uuid4())[:8]
-    output_file = str(BASE_DIR / f"agm_notice_result_{job_id}.xlsx")
-    progress_file = str(BASE_DIR / f"progress_agm_{job_id}.json")
-
-    args = [
-        sys.executable,
-        str(BASE_DIR / "generate_agm_notice_excel.py"),
-        "--start-date", payload.start_date,
-        "--end-date", payload.end_date,
-        "--companies-json", json.dumps(payload.companies, ensure_ascii=False),
-        "--output", output_file,
-        "--progress-file", progress_file
-    ]
-
-    proc = subprocess.Popen(
-        args,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True
-    )
-
-    jobs[job_id] = {
-        "process": proc,
-        "output_file": output_file,
-        "progress_file": progress_file,
-        "stdout": "",
-        "stderr": "",
-        "returncode": None,
-        "created_at": time.time()
-    }
-
-    t = threading.Thread(target=monitor_process, args=(job_id, proc), daemon=True)
-    t.start()
-
-    return {"job_id": job_id}
-
-
-@app.post("/start-kind-download")
-def start_kind_download(payload: KindDownloadRequest):
-    job_id = str(uuid.uuid4())[:8]
-    output_file = str(BASE_DIR / f"kind_institution_result_{job_id}.xlsx")
-    progress_file = str(BASE_DIR / f"progress_kind_{job_id}.json")
-
-    args = [
-        sys.executable,
-        str(BASE_DIR / "generate_kind_institution_excel.py"),
-        "--start-date", payload.start_date,
-        "--end-date", payload.end_date,
-        "--output", output_file,
-        "--progress-file", progress_file
-    ]
-
-    proc = subprocess.Popen(
-        args,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True
-    )
-
-    jobs[job_id] = {
-        "process": proc,
-        "output_file": output_file,
-        "progress_file": progress_file,
-        "stdout": "",
-        "stderr": "",
-        "returncode": None,
-        "created_at": time.time()
-    }
-
-    t = threading.Thread(target=monitor_process, args=(job_id, proc), daemon=True)
-    t.start()
-
-    return {"job_id": job_id}
 
 
 @app.get("/download-file/{job_id}")
@@ -478,12 +388,11 @@ def download_file(job_id: str):
         return JSONResponse(status_code=404, content={"error": "job not found"})
 
     output_file = jobs[job_id]["output_file"]
-
     if not os.path.exists(output_file):
         return JSONResponse(status_code=404, content={"error": "file not found"})
 
     return FileResponse(
         path=output_file,
         filename=os.path.basename(output_file),
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
