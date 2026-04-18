@@ -251,11 +251,40 @@
     <div class="error-box" id="rmErrorBox"></div>
   </div>
 
+  <div class="section">
+    <h2>국내기관 데이터</h2>
+    <p style="font-size:13px;color:#555;margin-bottom:18px;">
+      KIND 의결권행사공시에서 「의결권 행사 및 불행사 세부내용」엑셀을 수집합니다.
+    </p>
+
+    <div class="field">
+      <label>시작일</label><br>
+      <input type="date" id="kiStartDate">
+    </div>
+
+    <div class="field">
+      <label>종료일</label><br>
+      <input type="date" id="kiEndDate">
+    </div>
+
+    <button onclick="startDownload('ki')">엑셀 다운로드</button>
+
+    <div class="progress-wrap" id="kiProgressWrap">
+      <div class="progress-bar-bg">
+        <div class="progress-bar-fill" id="kiProgressFill"></div>
+      </div>
+      <div class="progress-text" id="kiProgressText">대기 중...</div>
+    </div>
+
+    <div class="error-box" id="kiErrorBox"></div>
+  </div>
+
   <script>
     const state = {
       cg: { selectedCompanies: [], selectedSuggestion: null, pollTimer: null, suggestionTimer: null },
       rm: { selectedCompanies: [], selectedSuggestion: null, pollTimer: null, suggestionTimer: null },
-      an: { selectedCompanies: [], selectedSuggestion: null, pollTimer: null, suggestionTimer: null }
+      an: { selectedCompanies: [], selectedSuggestion: null, pollTimer: null, suggestionTimer: null },
+      ki: { pollTimer: null }
     };
 
     function setDateRanges() {
@@ -268,6 +297,8 @@
       document.getElementById("rmEndDate").max = today;
       document.getElementById("anStartDate").max = today;
       document.getElementById("anEndDate").max = today;
+      document.getElementById("kiStartDate").max = today;
+      document.getElementById("kiEndDate").max = today;
     }
 
     function toggleCompanyMode(prefix) {
@@ -419,11 +450,14 @@
     async function startDownload(prefix) {
       const startDate = document.getElementById(`${prefix}StartDate`).value;
       const endDate = document.getElementById(`${prefix}EndDate`).value;
-      const companyMode = document.getElementById(`${prefix}CompanyMode`).value;
       const errorBox = document.getElementById(`${prefix}ErrorBox`);
       const progressWrap = document.getElementById(`${prefix}ProgressWrap`);
       const progressFill = document.getElementById(`${prefix}ProgressFill`);
       const progressText = document.getElementById(`${prefix}ProgressText`);
+
+      // ki 섹션은 companyMode 없음
+      const companyModeEl = document.getElementById(`${prefix}CompanyMode`);
+      const companyMode = companyModeEl ? companyModeEl.value : "all";
 
       errorBox.textContent = "";
 
@@ -437,7 +471,7 @@
         return;
       }
 
-      if (companyMode === "select" && state[prefix].selectedCompanies.length === 0) {
+      if (companyMode === "select" && state[prefix].selectedCompanies && state[prefix].selectedCompanies.length === 0) {
         alert("회사를 하나 이상 추가하세요.");
         return;
       }
@@ -449,12 +483,13 @@
       const payload = {
         start_date: startDate,
         end_date: endDate,
-        companies: companyMode === "all" ? [] : state[prefix].selectedCompanies
+        companies: (companyMode === "all" || prefix === "ki") ? [] : state[prefix].selectedCompanies
       };
 
       let apiUrl = "/start-download";
       if (prefix === "rm") apiUrl = "/start-regular-download";
       if (prefix === "an") apiUrl = "/start-agm-notice-download";
+      if (prefix === "ki") apiUrl = "/start-kind-download";
 
       try {
         const res = await fetch(apiUrl, {
@@ -529,6 +564,7 @@
       attachSearchListener("cg");
       attachSearchListener("rm");
       attachSearchListener("an");
+      // ki 섹션은 회사 검색 없음 — attachSearchListener 불필요
     }
 
     init();
