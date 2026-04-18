@@ -269,8 +269,17 @@ def extract_text_sections(file_path):
        실제 의안 목록이 아닌 비교표 텍스트를 읽는 오류를 방지하기 위해,
        "부의안건"이 실제로 존재하는 소집공고 절을 정확히 찾는다.
     """
-    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-        content = f.read()
+    # UTF-8 우선 → EUC-KR(cp949) fallback (DART HTML은 보통 UTF-8이나 일부 EUC-KR)
+    with open(file_path, "rb") as f:
+        _raw = f.read()
+    for _enc in ("utf-8", "euc-kr", "cp949"):
+        try:
+            content = _raw.decode(_enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        content = _raw.decode("utf-8", errors="ignore")
 
     soup = BeautifulSoup(content, "lxml")
 
@@ -288,13 +297,14 @@ def extract_text_sections(file_path):
     # "부의안건" 또는 "목적사항" 위치 탐색
     # ★ 정정공고는 비교표 안에도 같은 키워드가 등장하므로 반드시 마지막(가장 뒤) 위치를 사용
     # ★ 호텔신라 등: "부의안건" 대신 "3. 회의 목적사항" 형태 사용
-    #    → [3-6].\s*목적사항 패턴이 "회의"가 끼면 실패하므로 넓은 패턴으로 대체
+    # ★ "목적사항" 단독 패턴은 "이사회 의안에 대한 목적사항" 등 section I 내용을 잘못 잡을 수 있어
+    #    최후 fallback은 "결의\s*사\s*항"으로 한정한다
     agenda_section_pats = [
         r'나\s*[\.．]\s*부\s*의\s*안\s*건',
         r'나\s*\.\s*부의안건',
         r'부\s*의\s*안\s*건',
         r'[2-7]\s*[\.．]\s*[가-힣\s]{0,10}목\s*적\s*사\s*항',  # "3. 회의 목적사항" 등 포함
-        r'목\s*적\s*사\s*항',  # 최후 fallback: 패턴 없이 "목적사항"만으로 탐색
+        r'결\s*의\s*사\s*항',  # 최후 fallback: "결의사항"으로 한정 (section I 오탐 방지)
     ]
     agenda_pos = -1
     for pat in agenda_section_pats:
@@ -304,25 +314,31 @@ def extract_text_sections(file_path):
             break
 
     if agenda_pos != -1:
-        # 부의안건/목적사항 앞에서 소집공고 시작점을 역방향으로 탐색 (최대 8000자)
-        search_window = full_text[max(0, agenda_pos - 8000): agenda_pos]
+        # 부의안건/결의사항 앞에서 소집공고 시작점을 역방향으로 탐색 (최대 12000자)
+        # 탐색 창을 더 넓게 잡고, 패턴 중 가장 늦은 위치의 매치를 선택
+        search_window_start = max(0, agenda_pos - 12000)
+        search_window = full_text[search_window_start: agenda_pos]
         back_patterns = [
             r'주\s*주\s*총\s*회\s*소\s*집\s*공\s*고',
             r'소\s*집\s*공\s*고',
             r'\(제\d+기\s*정기\)',
+            r'가\s*\.\s*주\s*주\s*총\s*회\s*개\s*요',  # "가. 주주총회 개요" 바로 앞
             r'[1１]\s*\.\s*일\s*시',
+            r'[1１]\s*\.\s*일\s*[\s]*자',
         ]
-        best_back = None
+        # 각 패턴의 마지막 매치 위치 중 가장 큰 것(가장 늦은 것)을 사용
+        # → section I 내 "소집공고" 언급이 있어도 실제 공고문 시작이 더 뒤에 있으면 그걸 사용
+        best_pos_in_window = -1
         for bp in back_patterns:
             for bm in _re.finditer(bp, search_window):
-                best_back = bm  # 마지막(가장 늦은) 매치를 사용
-        if best_back is not None:
-            notice_start = max(0, agenda_pos - 8000) + best_back.start()
+                if bm.start() > best_pos_in_window:
+                    best_pos_in_window = bm.start()
+        if best_pos_in_window != -1:
+            notice_start = search_window_start + best_pos_in_window
         else:
             notice_start = max(0, agenda_pos - 500)
     else:
         # ★ 넓은 범위 접근법: 모든 패턴 실패 → 문서 맨 앞부터 사용
-        # AI가 전체 문서를 읽고 안건 섹션을 직접 찾도록 함
         notice_start = 0
 
     # ── 목적사항별 기재사항 섹션 시작점 찾기 ──
@@ -373,7 +389,7 @@ def parse_and_analyze_with_ai(notice_text, corp_name, full_text_fallback=""):
         r'|나\.\s*부\s*의\s*안\s*건'
         r'|부의\s*안건'
         r'|[2-7]\s*[\.．]\s*[가-힣\s]{0,10}목\s*적\s*사\s*항'
-        r'|목\s*적\s*사\s*항'
+        r'|결\s*의\s*사\s*항'   # "목적사항" 단독 대신 "결의사항"으로 한정
     )
     all_agenda_matches = list(agenda_section_pat.finditer(text_to_use))
     m = all_agenda_matches[-1] if all_agenda_matches else None
@@ -406,6 +422,9 @@ def parse_and_analyze_with_ai(notice_text, corp_name, full_text_fallback=""):
    [안건 추출 규칙]
    - 결의사항(부의안건)에 있는 안건만 추출 (보고사항 제외)
    - 재무제표 승인 안건도 포함
+   - ★ 주의: "I. 사외이사 등의 활동내역" 섹션에 있는 "이사회 의안에 대한 찬반여부" 표는
+     이사회 내부 결의 목록이지 주주총회 안건이 아님 → 절대 추출하지 말 것
+   - ★ 주의: 후보자 정보표(선임 후보자 약력/직업 테이블)도 안건 목록이 아님 → 제외
    - 안건에 하위 안건이 있는 경우, 반드시 최하위 안건만 추출:
        * 2단계: 제2호 아래 제2-1호, 제2-2호가 있으면 → 제2-1호, 제2-2호만 추출 (제2호 제외)
        * 3단계: 제2-1호 아래 제2-1-1호, 제2-1-2호가 있으면 → 제2-1-1호, 제2-1-2호만 추출 (제2호, 제2-1호 모두 제외)
