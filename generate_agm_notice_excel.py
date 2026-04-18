@@ -1706,141 +1706,184 @@ def fetch_agm_result_rcept_no(corp_code, bgn_de, end_de):
     return ""
 
 
-def extract_agm_result_table(file_path):
+def _decode_report_bytes(raw):
+    for enc in ('utf-8', 'euc-kr', 'cp949'):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode('utf-8', errors='ignore')
+
+
+def _iter_report_markup_files(path_or_folder):
+    """결과 보고서 폴더/파일에서 XML/HTML 파일을 재귀적으로 순회한다."""
+    if not path_or_folder:
+        return
+    if os.path.isdir(path_or_folder):
+        for root, _, files in os.walk(path_or_folder):
+            for fname in files:
+                lower = fname.lower()
+                if lower.endswith(('.xml', '.html', '.htm')):
+                    yield os.path.join(root, fname)
+    elif os.path.isfile(path_or_folder) and path_or_folder.lower().endswith(('.xml', '.html', '.htm')):
+        yield path_or_folder
+
+
+def _score_result_table(table, combined_headers, grid):
+    """주주총회 안건 세부내역 결과표 후보에 점수를 부여한다."""
+    text_nsp = re.sub(r'\s+', '', table.get_text())
+    score = 0
+    if '주주총회안건세부내역' in text_nsp:
+        score += 100
+    if '가결여부' in text_nsp:
+        score += 20
+    if '결의구분' in text_nsp:
+        score += 20
+    if '회의목적사항' in text_nsp or '목적사항' in text_nsp or '의안명' in text_nsp or '안건명' in text_nsp:
+        score += 20
+    score += min(30, len(grid))
+    header_text = ''.join(combined_headers)
+    if '찬성' in header_text:
+        score += 10
+    if '반대' in header_text:
+        score += 10
+    if '비고' in header_text:
+        score += 5
+    return score
+
+
+def extract_agm_result_table(path_or_folder):
     """
-    정기주주총회결과 HTML에서 '주주총회 안건 세부내역' 표를 파싱한다.
+    정기주주총회결과 보고서에서 '주주총회 안건 세부내역' 표를 파싱한다.
+    zip을 풀어놓은 폴더 전체를 재귀적으로 훑어서, 삼성전자처럼 상세 표가
+    별도 XML/HTML 첨부에 들어 있는 경우도 빠짐없이 잡는다.
+
     반환: {정규화번호: {"결의구분":, "회의목적사항":, "가결여부":,
                        "찬성률1":, "찬성률2":, "반대율":, "비고":}}
     """
-    empty = {}
-    try:
-        with open(file_path, 'rb') as f:
-            raw = f.read()
-        # UTF-8 우선, 실패 시 EUC-KR(cp949) fallback
-        for enc in ('utf-8', 'euc-kr', 'cp949'):
-            try:
-                content = raw.decode(enc)
-                break
-            except UnicodeDecodeError:
+    best_result = {}
+    best_score = -1
+
+    for file_path in _iter_report_markup_files(path_or_folder):
+        try:
+            with open(file_path, 'rb') as f:
+                raw = f.read()
+            content = _decode_report_bytes(raw)
+            soup = BeautifulSoup(content, 'lxml')
+        except Exception:
+            continue
+
+        for table in soup.find_all('table'):
+            table_text_nsp = re.sub(r'\s+', '', table.get_text())
+            if '가결여부' not in table_text_nsp:
                 continue
-        else:
-            content = raw.decode('utf-8', errors='ignore')
-        soup = BeautifulSoup(content, 'lxml')
-    except Exception:
-        return empty
+            if not any(kw in table_text_nsp for kw in ['결의구분', '회의목적사항', '목적사항', '의안명', '안건명']):
+                continue
 
-    result = {}
+            grid = _build_logical_table(table)
+            if not grid or len(grid) < 2:
+                continue
 
-    for table in soup.find_all('table'):
-        table_text_nsp = re.sub(r'\s+', '', table.get_text())
-        # "가결여부" + "결의구분" 또는 "회의목적사항" 을 포함하는 테이블만 처리
-        if '가결여부' not in table_text_nsp:
-            continue
-        if '결의구분' not in table_text_nsp and '회의목적사항' not in table_text_nsp:
-            continue
+            HEADER_KWS = {'번호', '결의구분', '가결여부', '회의목적사항', '목적사항', '의안명', '안건명', '찬성', '반대', '비고'}
+            header_rows = []
+            data_start = 0
+            for row_idx, row in enumerate(grid):
+                combined = re.sub(r'\s+', '', ''.join(row))
+                if any(kw in combined for kw in HEADER_KWS):
+                    first = re.sub(r'\s+', '', row[0]) if row else ''
+                    if not re.match(r'^\d', first):
+                        header_rows.append(row_idx)
+                        data_start = row_idx + 1
 
-        grid = _build_logical_table(table)
-        if not grid or len(grid) < 2:
-            continue
+            if not header_rows:
+                continue
 
-        # 헤더 행 식별 (번호/결의구분/가결여부 등 포함 행)
-        HEADER_KWS = {'번호', '결의구분', '가결여부', '회의목적사항', '찬성', '반대', '비고'}
-        header_rows = []
-        data_start = 0
-        for row_idx, row in enumerate(grid):
-            combined = re.sub(r'\s+', '', ''.join(row))
-            if any(kw in combined for kw in HEADER_KWS):
-                # 실제 숫자 데이터 행이 아닌 경우만 헤더로
-                first = re.sub(r'\s+', '', row[0]) if row else ''
-                if not re.match(r'^\d', first):
-                    header_rows.append(row_idx)
-                    data_start = row_idx + 1
+            n_cols = max(len(r) for r in grid)
+            combined_headers = []
+            for col_idx in range(n_cols):
+                parts = []
+                for row_idx in header_rows:
+                    if col_idx < len(grid[row_idx]):
+                        t = re.sub(r'[\s　 \(\)①②③④⑤]+', '', grid[row_idx][col_idx])
+                        if t and t not in parts:
+                            parts.append(t)
+                combined_headers.append(''.join(parts))
 
-        if not header_rows:
-            continue
+            def _find_col(keywords, exclude=()):
+                for i, h in enumerate(combined_headers):
+                    if i in exclude:
+                        continue
+                    if any(kw in h for kw in keywords):
+                        return i
+                return -1
 
-        # 열별 합성 헤더 생성 (다중 행 헤더 대응)
-        n_cols = max(len(r) for r in grid)
-        combined_headers = []
-        for col_idx in range(n_cols):
-            parts = []
-            for row_idx in header_rows:
-                if col_idx < len(grid[row_idx]):
-                    t = re.sub(r'[\s\u3000\xa0\(\)①②③④⑤]+', '', grid[row_idx][col_idx])
-                    if t and t not in parts:
-                        parts.append(t)
-            combined_headers.append(''.join(parts))
+            num_col = _find_col(['번호'])
+            category_col = _find_col(['결의구분'], exclude=(num_col,))
+            title_col = _find_col(['회의목적사항', '목적사항', '의안명', '안건명', '의안의내용'], exclude=(num_col, category_col))
+            pass_col = _find_col(['가결여부', '결의결과'], exclude=(num_col, category_col, title_col))
 
-        # 각 열 인덱스 탐지
-        def _find_col(keywords, exclude=()):
+            rate1_col = -1
             for i, h in enumerate(combined_headers):
-                if i in exclude:
+                if i in (num_col, category_col, title_col, pass_col):
                     continue
-                if any(kw in h for kw in keywords):
-                    return i
-            return -1
+                if ('발행주식' in h or '발생주식' in h or '발행주식총수' in h or '발생주식총수' in h) and '찬성' in h:
+                    rate1_col = i
+                    break
+            if rate1_col == -1:
+                rate1_col = _find_col(['찬성'], exclude=(num_col, category_col, title_col, pass_col))
 
-        num_col = _find_col(['번호'])
-        category_col = _find_col(['결의구분'], exclude=(num_col,))
-        title_col = _find_col(['회의목적사항', '목적사항'], exclude=(num_col, category_col))
-        pass_col = _find_col(['가결여부'], exclude=(num_col, category_col, title_col))
+            rate2_col = _find_col(['의결권', '찬성'], exclude=(num_col, category_col, title_col, pass_col, rate1_col))
+            if rate2_col == -1:
+                for i, h in enumerate(combined_headers):
+                    if i in (num_col, category_col, title_col, pass_col, rate1_col):
+                        continue
+                    if ('찬성' in h and '%' in h) or ('의결권행사주식수기준찬성률' in h):
+                        rate2_col = i
+                        break
 
-        # 찬성률(1): 발행/발생주식총수 기준
-        rate1_col = -1
-        for i, h in enumerate(combined_headers):
-            if i in (num_col, category_col, title_col, pass_col):
+            against_col = _find_col(['반대기관', '반대·기관', '반대기관등', '반대', '기관'],
+                                    exclude=(num_col, category_col, title_col, pass_col, rate1_col, rate2_col))
+            note_col = _find_col(['비고'], exclude=(num_col,))
+
+            if num_col == -1 or title_col == -1:
                 continue
-            if ('발행주식' in h or '발생주식' in h) and '찬성' in h:
-                rate1_col = i; break
-        if rate1_col == -1:  # fallback: 첫 번째 찬성 열
-            rate1_col = _find_col(['찬성'], exclude=(num_col, category_col, title_col, pass_col))
 
-        # (1)중 의결권 행사 기준 찬성률
-        rate2_col = _find_col(['의결권', '찬성'],
-                               exclude=(num_col, category_col, title_col, pass_col, rate1_col))
-        if rate2_col == -1:
-            # fallback: rate1_col 다음에 오는 찬성 열
-            for i, h in enumerate(combined_headers):
-                if i in (num_col, category_col, title_col, pass_col, rate1_col):
+            candidate_result = {}
+            for row in grid[data_start:]:
+                if len(row) <= max(num_col, title_col):
                     continue
-                if '찬성' in h or '%' in h:
-                    rate2_col = i; break
+                num_raw = row[num_col].strip()
+                title_raw = row[title_col].strip() if title_col < len(row) else ''
+                if not num_raw or not re.search(r'\d', num_raw):
+                    continue
+                if not title_raw:
+                    continue
+                num_key = normalize_num_for_match(num_raw)
+                if not num_key:
+                    continue
 
-        # 반대·기관 비율
-        against_col = _find_col(['반대', '기관'],
-                                  exclude=(num_col, category_col, title_col, pass_col,
-                                           rate1_col, rate2_col))
+                def _get(col):
+                    return row[col].strip() if 0 <= col < len(row) else ""
 
-        note_col = _find_col(['비고'], exclude=(num_col,))
+                candidate_result[num_key] = {
+                    "결의구분": _get(category_col),
+                    "회의목적사항": _get(title_col),
+                    "가결여부": _get(pass_col),
+                    "찬성률1": _get(rate1_col),
+                    "찬성률2": _get(rate2_col),
+                    "반대율": _get(against_col),
+                    "비고": _get(note_col),
+                }
 
-        if num_col == -1:
-            continue
-
-        # 데이터 행 파싱
-        for row in grid[data_start:]:
-            if len(row) <= num_col:
+            if not candidate_result:
                 continue
-            num_raw = row[num_col].strip()
-            if not num_raw or not re.search(r'\d', num_raw):
-                continue
-            num_key = normalize_num_for_match(num_raw)
-            if not num_key:
-                continue
 
-            def _get(col):
-                return row[col].strip() if 0 <= col < len(row) else ""
+            score = _score_result_table(table, combined_headers, grid) + len(candidate_result) * 5
+            if score > best_score:
+                best_score = score
+                best_result = candidate_result
 
-            result[num_key] = {
-                "결의구분":    _get(category_col),
-                "회의목적사항": _get(title_col),
-                "가결여부":    _get(pass_col),
-                "찬성률1":    _get(rate1_col),
-                "찬성률2":    _get(rate2_col),
-                "반대율":     _get(against_col),
-                "비고":       _get(note_col),
-            }
-
-    return result
+    return best_result
 
 
 # ─────────────────────────────────────────────
@@ -2456,11 +2499,9 @@ def main():
         rfolder = download_report(result_rcept)
         if not rfolder:
             continue
-        rfile = find_main_file(rfolder)
-        if rfile:
-            corp_result_map[corp_code_r] = extract_agm_result_table(rfile)
-            if not corp_result_map[corp_code_r]:
-                print(f"  [결과표 파싱 실패] {corp_name_r}")
+        corp_result_map[corp_code_r] = extract_agm_result_table(rfolder)
+        if not corp_result_map[corp_code_r]:
+            print(f"  [결과표 파싱 실패] {corp_name_r}")
         shutil.rmtree(rfolder, ignore_errors=True)
         time.sleep(0.08)
 
