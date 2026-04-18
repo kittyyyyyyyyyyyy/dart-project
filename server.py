@@ -21,13 +21,14 @@ INDEX_HTML = BASE_DIR / "index.html"
 COMPANY_CACHE_FILE = BASE_DIR / "company_names.json"
 LOCAL_CORP_XML = BASE_DIR / "corp_data" / "CORPCODE.xml"
 API_KEY = os.getenv("DART_API_KEY")
+BUILD_MARKER = "2026-04-18-v2"
 
 app = FastAPI()
 jobs = {}
 company_cache = {
     "loaded_at": 0,
     "names": [],
-    "source": None
+    "source": None,
 }
 
 
@@ -39,7 +40,7 @@ def make_session():
         read=3,
         backoff_factor=1.0,
         status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"]
+        allowed_methods=["GET"],
     )
     adapter = HTTPAdapter(max_retries=retry)
     session.mount("https://", adapter)
@@ -76,10 +77,10 @@ def load_company_names_from_local_xml():
             if corp_name and stock_code:
                 names.add(corp_name)
         result = sorted(names)
-        print(f"로컬 XML에서 회사명 {len(result)}개 로드 완료")
+        print(f"[{BUILD_MARKER}] 로컬 XML에서 회사명 {len(result)}개 로드 완료")
         return result
     except Exception as e:
-        print(f"로컬 XML 파싱 실패: {e}")
+        print(f"[{BUILD_MARKER}] 로컬 XML 파싱 실패: {e}")
         return []
 
 
@@ -136,7 +137,7 @@ def ensure_company_cache_loaded():
             pass
         return names
     except Exception as e:
-        print("회사명 목록 초기 로드 실패:", str(e))
+        print(f"[{BUILD_MARKER}] 회사명 목록 초기 로드 실패: {str(e)}")
         return []
 
 
@@ -192,17 +193,25 @@ def page():
 
 @app.get("/health")
 def health():
-    return {"message": "server running"}
+    return {
+        "message": "server running",
+        "build_marker": BUILD_MARKER,
+        "base_dir": str(BASE_DIR),
+    }
 
 
 @app.get("/startup-debug")
 def startup_debug():
     return {
+        "build_marker": BUILD_MARKER,
         "cwd": os.getcwd(),
         "base_dir": str(BASE_DIR),
         "index_exists": INDEX_HTML.exists(),
         "corp_xml_exists": LOCAL_CORP_XML.exists(),
+        "company_cache_file_exists": COMPANY_CACHE_FILE.exists(),
         "python": sys.executable,
+        "port_env": os.getenv("PORT"),
+        "has_dart_api_key": bool(API_KEY),
     }
 
 
@@ -211,7 +220,8 @@ def env_check():
     value = os.getenv("DART_API_KEY")
     return {
         "has_key": bool(value),
-        "prefix": value[:5] if value else None
+        "prefix": value[:5] if value else None,
+        "build_marker": BUILD_MARKER,
     }
 
 
@@ -219,7 +229,7 @@ def env_check():
 def company_suggestions(q: str = Query(...)):
     keyword = q.strip()
     if not keyword:
-        return {"companies": [], "count": 0}
+        return {"companies": [], "count": 0, "build_marker": BUILD_MARKER}
 
     all_names = ensure_company_cache_loaded()
     q_lower = keyword.lower()
@@ -236,7 +246,7 @@ def company_suggestions(q: str = Query(...)):
             break
 
     matched = (starts + contains)[:20]
-    return {"companies": matched, "count": len(matched)}
+    return {"companies": matched, "count": len(matched), "build_marker": BUILD_MARKER}
 
 
 @app.post("/start-download")
@@ -254,7 +264,7 @@ def start_download(payload: DownloadRequest):
         "--progress-file", str(progress_file),
     ]
     _spawn_job(job_id, output_file, progress_file, args)
-    return {"job_id": job_id}
+    return {"job_id": job_id, "build_marker": BUILD_MARKER}
 
 
 @app.post("/start-regular-download")
@@ -272,7 +282,7 @@ def start_regular_download(payload: DownloadRequest):
         "--progress-file", str(progress_file),
     ]
     _spawn_job(job_id, output_file, progress_file, args)
-    return {"job_id": job_id}
+    return {"job_id": job_id, "build_marker": BUILD_MARKER}
 
 
 @app.post("/start-agm-notice-download")
@@ -290,7 +300,7 @@ def start_agm_notice_download(payload: DownloadRequest):
         "--progress-file", str(progress_file),
     ]
     _spawn_job(job_id, output_file, progress_file, args)
-    return {"job_id": job_id}
+    return {"job_id": job_id, "build_marker": BUILD_MARKER}
 
 
 @app.post("/start-kind-download")
@@ -307,7 +317,7 @@ def start_kind_download(payload: KindDownloadRequest):
         "--progress-file", str(progress_file),
     ]
     _spawn_job(job_id, output_file, progress_file, args)
-    return {"job_id": job_id}
+    return {"job_id": job_id, "build_marker": BUILD_MARKER}
 
 
 @app.get("/job-status/{job_id}")
@@ -330,7 +340,7 @@ def job_status(job_id: str):
         except Exception:
             pass
     if proc.poll() is None:
-        return {"job_id": job_id, "state": "running", "progress": progress}
+        return {"job_id": job_id, "state": "running", "progress": progress, "build_marker": BUILD_MARKER}
     if job["returncode"] != 0:
         return {
             "job_id": job_id,
@@ -338,6 +348,7 @@ def job_status(job_id: str):
             "progress": progress,
             "stdout": job["stdout"],
             "stderr": job["stderr"],
+            "build_marker": BUILD_MARKER,
         }
     if os.path.exists(job["output_file"]):
         return {
@@ -351,6 +362,7 @@ def job_status(job_id: str):
                 "total": progress.get("total", 0),
             },
             "download_url": f"/download-file/{job_id}",
+            "build_marker": BUILD_MARKER,
         }
     return {
         "job_id": job_id,
@@ -359,6 +371,7 @@ def job_status(job_id: str):
         "stdout": job["stdout"],
         "stderr": job["stderr"],
         "error": "엑셀 파일을 찾을 수 없습니다.",
+        "build_marker": BUILD_MARKER,
     }
 
 
