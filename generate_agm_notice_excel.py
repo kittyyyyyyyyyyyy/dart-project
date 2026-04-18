@@ -20,7 +20,7 @@ load_dotenv()
 API_KEY = os.getenv("DART_API_KEY")
 AWS_REGION = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
 BEDROCK_MODEL_ID = "anthropic.claude-3-haiku-20240307-v1:0"
-BEDROCK_MODEL_ID_HAIKU35 = "anthropic.claude-3-5-haiku-20241022-v1:0"
+BEDROCK_MODEL_ID_HAIKU35 = "us.anthropic.claude-3-5-haiku-20241022-v1:0"
 
 if not API_KEY:
     raise ValueError("DART_API_KEY가 없습니다. .env 또는 환경 변수를 확인하세요.")
@@ -2093,8 +2093,14 @@ def main():
 
     # ── 주주총회결과 보고서 fetch & 매칭 ──
     # 결과보고서는 소집공고 기간 이후에 올라오므로 +90일 범위로 검색
-    result_end_date = (datetime.strptime(end_date, "%Y%m%d") + timedelta(days=90)).strftime("%Y%m%d")
-    result_start_date = start_date  # 소집공고 시작일부터
+    # 날짜 형식 정규화: "2026-02-25" → "20260225"
+    def _norm_date(d):
+        return d.replace("-", "").replace("/", "").strip()
+
+    end_date_norm = _norm_date(end_date)
+    start_date_norm = _norm_date(start_date)
+    result_end_date = (datetime.strptime(end_date_norm, "%Y%m%d") + timedelta(days=90)).strftime("%Y%m%d")
+    result_start_date = start_date_norm  # 소집공고 시작일부터
 
     write_progress(progress_file, "running", 96, "주주총회결과 보고서 검색 중...")
 
