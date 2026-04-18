@@ -2,4 +2,4 @@ myenv/
 __pycache__/
 report_*/
 *.csv
-.env
+.env*.xlsx
