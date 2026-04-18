@@ -14,8 +14,6 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import boto3
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock
 
 load_dotenv()
 
@@ -23,9 +21,6 @@ API_KEY = os.getenv("DART_API_KEY")
 AWS_REGION = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
 BEDROCK_MODEL_ID = "anthropic.claude-3-haiku-20240307-v1:0"
 BEDROCK_MODEL_ID_HAIKU35 = "us.anthropic.claude-3-5-haiku-20241022-v1:0"
-
-MAX_NOTICE_WORKERS = max(2, min(6, (os.cpu_count() or 2)))
-MAX_RESULT_WORKERS = max(2, min(8, (os.cpu_count() or 2) + 2))
 
 if not API_KEY:
     raise ValueError("DART_API_KEY가 없습니다. .env 또는 환경 변수를 확인하세요.")
@@ -59,7 +54,6 @@ def create_bedrock_client():
 
 
 bedrock_client = create_bedrock_client()
-progress_lock = Lock()
 
 
 def call_bedrock(prompt, max_tokens=4096, model_id=None):
@@ -138,7 +132,7 @@ def write_progress(progress_file, status, percent, message, current=0, total=0):
         json.dump(data, f, ensure_ascii=False)
 
 
-def chunk_date_ranges(start_date_str, end_date_str, chunk_days=365):
+def chunk_date_ranges(start_date_str, end_date_str, chunk_days=90):
     start = datetime.strptime(start_date_str, "%Y-%m-%d")
     end = datetime.strptime(end_date_str, "%Y-%m-%d")
     ranges = []
@@ -219,7 +213,7 @@ def fetch_agm_notice_reports(start_date, end_date, company_names=None, progress_
                 if len(items) < 100:
                     break
                 page_no += 1
-                
+                time.sleep(0.12)
 
     # corp_code 기준으로 가장 최근 공고(rcept_no 최대값)만 남김
     # → 정정공고가 있으면 정정공고만, 없으면 원본만 엑셀에 포함
@@ -2161,202 +2155,6 @@ def _match_nps_vote(nps_votes, corp_name, meeting_date_yyyymmdd, num_key):
 # 8. 메인
 # ─────────────────────────────────────────────
 
-def process_notice_report(report):
-    corp_name = str(report.get("corp_name", ""))
-    stock_code = str(report.get("stock_code", ""))
-    rcept_no = str(report.get("rcept_no", ""))
-    corp_cls = str(report.get("corp_cls", ""))
-    rcept_dt = str(report.get("rcept_dt", ""))
-    corp_code = str(report.get("corp_code", ""))
-
-    market_label = ""
-    if corp_cls == "Y":
-        market_label = "유가증권"
-    elif corp_cls == "K":
-        market_label = "코스닥"
-
-    folder_name = download_report(rcept_no)
-    if not folder_name:
-        return {"rows": [], "fails": [[corp_name, stock_code, rcept_no, "download_fail"]]}
-
-    main_file = find_main_file(folder_name)
-    if not main_file:
-        shutil.rmtree(folder_name, ignore_errors=True)
-        return {"rows": [], "fails": [[corp_name, stock_code, rcept_no, "main_file_not_found"]]}
-
-    all_rows_local = []
-    fail_list_local = []
-    try:
-        notice_text, section2_text, full_text = extract_text_sections(main_file)
-
-        check_area = notice_text[:3000] if notice_text else full_text[:3000]
-        if "임시주주총회" in check_area:
-            fail_list_local.append([corp_name, stock_code, rcept_no, "임시주주총회_제외"])
-            return {"rows": [], "fails": fail_list_local}
-
-        parsed = parse_and_analyze_with_ai(notice_text, corp_name, full_text_fallback=full_text)
-        meeting_date = parsed.get("meeting_date", "")
-        agenda_items = parsed.get("agenda_items", [])
-        ai_error = parsed.get("error", "")
-
-        if not agenda_items:
-            reason = ai_error if ai_error else "ai_returned_no_agenda_items"
-            fail_list_local.append([corp_name, stock_code, rcept_no, reason])
-            return {"rows": [], "fails": fail_list_local}
-
-        nums_with_subs = set()
-        for item in agenda_items:
-            num = str(item.get("num", "")).strip()
-            parts = num.split('-')
-            for depth in range(1, len(parts)):
-                nums_with_subs.add('-'.join(parts[:depth]))
-        agenda_items = [
-            item for item in agenda_items
-            if str(item.get("num", "")).strip() not in nums_with_subs
-        ]
-        agenda_items.sort(key=lambda x: agenda_sort_key(str(x.get("num", ""))))
-
-        content_map = build_section2_content_map(section2_text)
-        has_charter = any(str(i.get("category1", "")) == "정관변경" for i in agenda_items)
-        charter_tables_by_num = extract_charter_tables_from_html(main_file) if has_charter else {}
-        has_선임 = any(str(i.get("category1", "")) == "이사감사선임" for i in agenda_items)
-        candidates_map = extract_director_candidates_from_html(main_file) if has_선임 else {}
-
-        for item in agenda_items:
-            agenda_num = str(item.get("num", ""))
-            agenda_title = str(item.get("title", ""))
-            category1 = str(item.get("category1", ""))
-            category2 = str(item.get("category2", ""))
-
-            charter_division = ""
-            before_content = ""
-            after_content = ""
-            purpose = ""
-            num_clean = ""
-
-            if category1 == "정관변경":
-                num_clean = agenda_num.replace(" ", "")
-                tbl = charter_tables_by_num.get(num_clean, {})
-                used_keys = {
-                    r.get("_charter_key", "") for r in all_rows_local
-                    if r.get("회사명") == corp_name and r.get("공고일") == rcept_dt
-                }
-                if not tbl and "-" in num_clean:
-                    parts = num_clean.split("-")
-                    for depth in range(len(parts) - 1, 0, -1):
-                        ancestor = "-".join(parts[:depth])
-                        candidate = charter_tables_by_num.get(ancestor, {})
-                        if candidate and ancestor not in used_keys:
-                            tbl = candidate
-                            num_clean = ancestor
-                            break
-                if not tbl:
-                    for k, v in charter_tables_by_num.items():
-                        if k not in used_keys:
-                            tbl = v
-                            num_clean = k
-                            break
-                charter_division = tbl.get("구분", "")
-                before_content = tbl.get("변경전 내용", "")
-                after_content = tbl.get("변경후 내용", "")
-                purpose = tbl.get("변경의 목적", "")
-                if before_content.strip() or after_content.strip():
-                    category2 = classify_charter_category(before_content, after_content, purpose, agenda_title)
-                else:
-                    category2 = ""
-
-            선임_성명 = 선임_사외이사여부 = 선임_분리선출여부 = 선임_주된직업 = ""
-            if category1 == "이사감사선임":
-                선임_성명, 선임_사외이사여부, 선임_분리선출여부, 선임_주된직업 = find_candidate_info(candidates_map, agenda_title)
-
-            당기_이사수 = 당기_사외이사수 = 당기_보수총액 = ""
-            전기_이사수 = 전기_사외이사수 = 전기_실제지급 = 전기_최고한도 = ""
-            if category1 == "이사감사보수":
-                remu = extract_remuneration_from_html(main_file)
-                if not any(v for v in remu.values()):
-                    remu_text = get_agenda_content(content_map, agenda_num, agenda_title)
-                    if not remu_text or len(remu_text.strip()) < 50:
-                        remu_text = section2_text
-                    if not remu_text or len(remu_text.strip()) < 50:
-                        bm = re.search(r'이사\s*보수\s*한도|보수\s*한도\s*승인', full_text)
-                        if bm:
-                            remu_text = full_text[bm.start(): bm.start() + 3000]
-                    remu = extract_remuneration_info(remu_text)
-                당기_이사수 = remu["당기_이사수"]
-                당기_사외이사수 = remu["당기_사외이사수"]
-                당기_보수총액 = remu["당기_보수총액또는최고한도액"]
-                전기_이사수 = remu["전기_이사수"]
-                전기_사외이사수 = remu["전기_사외이사수"]
-                전기_실제지급 = remu["전기_실제지급보수총액"]
-                전기_최고한도 = remu["전기_최고한도액"]
-
-            자사주승인_내용 = ""
-            if category1 == "자사주보유처분계획승인":
-                자사주승인_내용 = get_agenda_content(content_map, agenda_num, agenda_title)
-                if not 자사주승인_내용:
-                    zm = re.search(r'자기\s*주식\s*(?:보유|처분)|자사주\s*(?:보유|처분)', full_text)
-                    if zm:
-                        z_start = max(0, zm.start() - 200)
-                        자사주승인_내용 = full_text[z_start: zm.start() + 5000]
-
-            all_rows_local.append({
-                "회사명": corp_name,
-                "시장분류": market_label,
-                "공고일": rcept_dt,
-                "주총일": meeting_date,
-                "안건번호": format_agenda_num(agenda_num),
-                "안건 제목": agenda_title,
-                "주주제안여부": str(item.get("shareholder_proposal", "")),
-                "주주제안자": str(item.get("proposer", "")),
-                "안건분류1": category1,
-                "안건분류2": category2,
-                "[정관] 구분": charter_division,
-                "[정관] 변경전 내용": before_content,
-                "[정관] 변경후 내용": after_content,
-                "[정관] 변경의 목적": purpose,
-                "[선임] 후보자성명": 선임_성명,
-                "[선임] 사외이사 후보자여부": 선임_사외이사여부,
-                "[선임] 감사위원회 위원인 이사 분리선출 여부": 선임_분리선출여부,
-                "[선임] 주된직업": 선임_주된직업,
-                "[당기보수] 이사수": 당기_이사수,
-                "[당기보수] 사외이사수": 당기_사외이사수,
-                "[당기보수] 보수총액 또는 최고한도액": 당기_보수총액,
-                "[전기보수] 이사수": 전기_이사수,
-                "[전기보수] 사외이사수": 전기_사외이사수,
-                "[전기보수] 실제 지급된 보수총액": 전기_실제지급,
-                "[전기보수] 최고한도액": 전기_최고한도,
-                "[자사주승인]": 자사주승인_내용,
-                "_charter_key": num_clean if category1 == "정관변경" else "",
-                "_corp_code": corp_code,
-            })
-
-        return {"rows": all_rows_local, "fails": fail_list_local}
-    except Exception as e:
-        return {"rows": [], "fails": [[corp_name, stock_code, rcept_no, f"extract_error: {str(e)}"]]}
-    finally:
-        shutil.rmtree(folder_name, ignore_errors=True)
-
-
-def fetch_result_map_for_company(item):
-    corp_code_r, corp_name_r, result_start_date, result_end_date = item
-    result_rcept = fetch_agm_result_rcept_no(corp_code_r, result_start_date, result_end_date)
-    if not result_rcept:
-        return corp_code_r, {}
-    rfolder = download_report(result_rcept)
-    if not rfolder:
-        return corp_code_r, {}
-    try:
-        rfile = find_main_file(rfolder)
-        if not rfile:
-            return corp_code_r, {}
-        parsed = extract_agm_result_table(rfile)
-        if not parsed:
-            print(f"  [결과표 파싱 실패] {corp_name_r}")
-        return corp_code_r, parsed or {}
-    finally:
-        shutil.rmtree(rfolder, ignore_errors=True)
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--start-date", required=True)
@@ -2405,24 +2203,225 @@ def main():
         write_progress(progress_file, "done", 100, "완료 (검색 결과 없음)", 0, 0)
         return
 
-    with ThreadPoolExecutor(max_workers=MAX_NOTICE_WORKERS) as executor:
-        future_to_meta = {executor.submit(process_notice_report, report): (idx, report) for idx, report in enumerate(reports, start=1)}
+    for seq, report in enumerate(reports, start=1):
+        corp_name = str(report.get("corp_name", ""))
+        stock_code = str(report.get("stock_code", ""))
+        rcept_no = str(report.get("rcept_no", ""))
+        corp_cls = str(report.get("corp_cls", ""))
+        rcept_dt = str(report.get("rcept_dt", ""))
+        corp_code = str(report.get("corp_code", ""))
 
-        for completed, future in enumerate(as_completed(future_to_meta), start=1):
-            seq, report = future_to_meta[future]
-            corp_name = str(report.get("corp_name", ""))
-            percent = 45 + int((completed / total_reports) * 50)
-            write_progress(
-                progress_file,
-                "running",
-                percent,
-                f"{completed}/{total_reports} 처리 중: {corp_name}",
-                completed,
-                total_reports,
-            )
-            result = future.result()
-            all_rows.extend(result.get("rows", []))
-            fail_list.extend(result.get("fails", []))
+        market_label = ""
+        if corp_cls == "Y":
+            market_label = "유가증권"
+        elif corp_cls == "K":
+            market_label = "코스닥"
+
+        percent = 45 + int((seq / total_reports) * 50)
+        write_progress(progress_file, "running", percent,
+                       f"{seq}/{total_reports} 처리 중: {corp_name}", seq, total_reports)
+
+        folder_name = download_report(rcept_no)
+        if not folder_name:
+            fail_list.append([corp_name, stock_code, rcept_no, "download_fail"])
+            continue
+
+        main_file = find_main_file(folder_name)
+        if not main_file:
+            fail_list.append([corp_name, stock_code, rcept_no, "main_file_not_found"])
+            shutil.rmtree(folder_name, ignore_errors=True)
+            continue
+
+        try:
+            # 소집공고 섹션 / 목적사항별 기재사항 섹션 분리 추출
+            notice_text, section2_text, full_text = extract_text_sections(main_file)
+
+            # ── 임시주주총회 제외: 소집공고 앞부분에 "임시주주총회" 표현 시 스킵 ──
+            check_area = notice_text[:3000] if notice_text else full_text[:3000]
+            if "임시주주총회" in check_area:
+                fail_list.append([corp_name, stock_code, rcept_no, "임시주주총회_제외"])
+                shutil.rmtree(folder_name, ignore_errors=True)
+                continue
+
+            # AI로 D/E열 파싱 + G/H/I/J열 분석 (보고서 1건당 1회 호출)
+            # notice_text가 짧으면 full_text를 fallback으로 전달
+            parsed = parse_and_analyze_with_ai(notice_text, corp_name,
+                                               full_text_fallback=full_text)
+            meeting_date = parsed.get("meeting_date", "")
+            agenda_items = parsed.get("agenda_items", [])
+            ai_error = parsed.get("error", "")
+
+            if not agenda_items:
+                reason = ai_error if ai_error else "ai_returned_no_agenda_items"
+                fail_list.append([corp_name, stock_code, rcept_no, reason])
+                shutil.rmtree(folder_name, ignore_errors=True)
+                continue
+
+            # ── 상위 안건 제거: 하위 안건이 있으면 모든 상위 레벨(조상) 제외 ──
+            # 예: "2-1-1" 존재 → "2"와 "2-1" 모두 제거
+            #     "2-1"   존재 → "2" 제거
+            nums_with_subs = set()
+            for item in agenda_items:
+                num = str(item.get("num", "")).strip()
+                parts = num.split('-')
+                # 2단계(2-1): 조상 "2" 추가 / 3단계(2-1-1): 조상 "2", "2-1" 추가
+                for depth in range(1, len(parts)):
+                    nums_with_subs.add('-'.join(parts[:depth]))
+            agenda_items = [
+                item for item in agenda_items
+                if str(item.get("num", "")).strip() not in nums_with_subs
+            ]
+
+            # ── 안건번호 순 정렬 ──
+            agenda_items.sort(key=lambda x: agenda_sort_key(str(x.get("num", ""))))
+
+            # F열용 section2 내용 맵 구성
+            content_map = build_section2_content_map(section2_text)
+
+            # 정관변경 안건이 있으면 HTML에서 표를 미리 파싱 (루프 밖에서 1회)
+            has_charter = any(str(i.get("category1", "")) == "정관변경" for i in agenda_items)
+            charter_tables_by_num = extract_charter_tables_from_html(main_file) if has_charter else {}
+
+            # 이사감사선임 안건이 있으면 후보자 테이블 미리 파싱 (루프 밖에서 1회)
+            has_선임 = any(str(i.get("category1", "")) == "이사감사선임" for i in agenda_items)
+            candidates_map = extract_director_candidates_from_html(main_file) if has_선임 else {}
+
+            for item in agenda_items:
+                agenda_num = str(item.get("num", ""))
+                agenda_title = str(item.get("title", ""))
+                category1 = str(item.get("category1", ""))
+                category2 = str(item.get("category2", ""))
+
+                # ── 정관변경 안건: 안건번호로 표 매핑 ──
+                charter_division = ""
+                before_content = ""
+                after_content = ""
+                purpose = ""
+
+                if category1 == "정관변경":
+                    num_clean = agenda_num.replace(" ", "")
+                    tbl = charter_tables_by_num.get(num_clean, {})
+
+                    # 이미 사용된 키 목록 (Fallback 1/2 공통으로 사용)
+                    used_keys = {
+                        r.get("_charter_key", "") for r in all_rows
+                        if r.get("회사명") == corp_name and r.get("공고일") == rcept_dt
+                    }
+
+                    # Fallback 1: 직계 부모 → 조부모 순으로 시도 (아직 미사용인 경우만)
+                    if not tbl and "-" in num_clean:
+                        parts = num_clean.split("-")
+                        # 직계 부모부터 거슬러 올라가며 시도 (2-1-1 → 2-1 → 2)
+                        for depth in range(len(parts) - 1, 0, -1):
+                            ancestor = "-".join(parts[:depth])
+                            candidate = charter_tables_by_num.get(ancestor, {})
+                            if candidate and ancestor not in used_keys:
+                                tbl = candidate
+                                num_clean = ancestor
+                                break
+
+                    # Fallback 2: 미매핑 표(_pos_N 포함) 중 첫 번째 사용
+                    if not tbl:
+                        for k, v in charter_tables_by_num.items():
+                            if k not in used_keys:
+                                tbl = v
+                                num_clean = k
+                                break
+
+                    charter_division = tbl.get("구분", "")
+                    before_content = tbl.get("변경전 내용", "")
+                    after_content = tbl.get("변경후 내용", "")
+                    purpose = tbl.get("변경의 목적", "")
+
+                    # AI로 category2만 분류 (변경전/변경후 내용이 둘 다 비어있으면 skip)
+                    if before_content.strip() or after_content.strip():
+                        category2 = classify_charter_category(
+                            before_content, after_content, purpose, agenda_title
+                        )
+                    else:
+                        category2 = ""
+
+                # ── 이사감사선임 안건: [선임] 정보 추출 ──
+                선임_성명 = 선임_사외이사여부 = 선임_분리선출여부 = 선임_주된직업 = ""
+                if category1 == "이사감사선임":
+                    선임_성명, 선임_사외이사여부, 선임_분리선출여부, 선임_주된직업 = find_candidate_info(
+                        candidates_map, agenda_title
+                    )
+
+                # ── 이사감사보수 안건: [보수] 정보 추출 ──
+                당기_이사수 = 당기_사외이사수 = 당기_보수총액 = ""
+                전기_이사수 = 전기_사외이사수 = 전기_실제지급 = 전기_최고한도 = ""
+                if category1 == "이사감사보수":
+                    # 1) HTML 테이블 직접 파싱 (primary — section2 위치/길이 제한 없음)
+                    remu = extract_remuneration_from_html(main_file)
+                    # 2) HTML 파싱 실패시 텍스트 파싱 fallback
+                    if not any(v for v in remu.values()):
+                        remu_text = get_agenda_content(content_map, agenda_num, agenda_title)
+                        if not remu_text or len(remu_text.strip()) < 50:
+                            remu_text = section2_text
+                        # section2_text에 없으면 full_text에서 보수 섹션 직접 탐색
+                        if not remu_text or len(remu_text.strip()) < 50:
+                            bm = re.search(r'이사\s*보수\s*한도|보수\s*한도\s*승인', full_text)
+                            if bm:
+                                remu_text = full_text[bm.start(): bm.start() + 3000]
+                        remu = extract_remuneration_info(remu_text)
+                    당기_이사수 = remu["당기_이사수"]
+                    당기_사외이사수 = remu["당기_사외이사수"]
+                    당기_보수총액 = remu["당기_보수총액또는최고한도액"]
+                    전기_이사수 = remu["전기_이사수"]
+                    전기_사외이사수 = remu["전기_사외이사수"]
+                    전기_실제지급 = remu["전기_실제지급보수총액"]
+                    전기_최고한도 = remu["전기_최고한도액"]
+
+                # ── 자사주보유처분계획승인 안건: 관련 내용 전부 추출 ──
+                자사주승인_내용 = ""
+                if category1 == "자사주보유처분계획승인":
+                    자사주승인_내용 = get_agenda_content(content_map, agenda_num, agenda_title)
+                    # content_map에 없으면 full_text에서 자기주식 섹션 탐색
+                    if not 자사주승인_내용:
+                        zm = re.search(r'자기\s*주식\s*(?:보유|처분)|자사주\s*(?:보유|처분)', full_text)
+                        if zm:
+                            z_start = max(0, zm.start() - 200)
+                            자사주승인_내용 = full_text[z_start: zm.start() + 5000]
+
+                all_rows.append({
+                    "회사명": corp_name,
+                    "시장분류": market_label,
+                    "공고일": rcept_dt,
+                    "주총일": meeting_date,
+                    "안건번호": format_agenda_num(agenda_num),
+                    "안건 제목": agenda_title,
+                    "주주제안여부": str(item.get("shareholder_proposal", "")),
+                    "주주제안자": str(item.get("proposer", "")),
+                    "안건분류1": category1,
+                    "안건분류2": category2,
+                    "[정관] 구분": charter_division,
+                    "[정관] 변경전 내용": before_content,
+                    "[정관] 변경후 내용": after_content,
+                    "[정관] 변경의 목적": purpose,
+                    "[선임] 후보자성명": 선임_성명,
+                    "[선임] 사외이사 후보자여부": 선임_사외이사여부,
+                    "[선임] 감사위원회 위원인 이사 분리선출 여부": 선임_분리선출여부,
+                    "[선임] 주된직업": 선임_주된직업,
+                    "[당기보수] 이사수": 당기_이사수,
+                    "[당기보수] 사외이사수": 당기_사외이사수,
+                    "[당기보수] 보수총액 또는 최고한도액": 당기_보수총액,
+                    "[전기보수] 이사수": 전기_이사수,
+                    "[전기보수] 사외이사수": 전기_사외이사수,
+                    "[전기보수] 실제 지급된 보수총액": 전기_실제지급,
+                    "[전기보수] 최고한도액": 전기_최고한도,
+                    "[자사주승인]": 자사주승인_내용,
+                    "_charter_key": num_clean if category1 == "정관변경" else "",
+                    "_corp_code": corp_code,
+                })
+
+        except Exception as e:
+            fail_list.append([corp_name, stock_code, rcept_no, f"extract_error: {str(e)}"])
+
+        finally:
+            shutil.rmtree(folder_name, ignore_errors=True)
+
+        time.sleep(0.08)
 
     # 내부 추적용 _charter_key 열 제거
     for row in all_rows:
@@ -2463,7 +2462,7 @@ def main():
             if not corp_result_map[corp_code_r]:
                 print(f"  [결과표 파싱 실패] {corp_name_r}")
         shutil.rmtree(rfolder, ignore_errors=True)
-        
+        time.sleep(0.08)
 
     # [결과] 열 데이터를 각 행에 매핑 (FULL OUTER JOIN)
     # ─ 소집공고에 있고 결과에도 있으면: 같은 행에 결과 채움
