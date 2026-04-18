@@ -7,5 +7,4 @@ beautifulsoup4
 lxml
 python-dotenv
 boto3
-playwright
 xlrd
