@@ -1695,8 +1695,17 @@ def extract_agm_result_table(file_path):
     """
     empty = {}
     try:
-        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            content = f.read()
+        with open(file_path, 'rb') as f:
+            raw = f.read()
+        # UTF-8 우선, 실패 시 EUC-KR(cp949) fallback
+        for enc in ('utf-8', 'euc-kr', 'cp949'):
+            try:
+                content = raw.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            content = raw.decode('utf-8', errors='ignore')
         soup = BeautifulSoup(content, 'lxml')
     except Exception:
         return empty
@@ -1816,7 +1825,315 @@ def extract_agm_result_table(file_path):
 
 
 # ─────────────────────────────────────────────
-# 7. 메인
+# 7. 국민연금 의결권 행사내역
+# ─────────────────────────────────────────────
+
+NPS_LIST_URL   = "https://fund.nps.or.kr/impa/edwmpblnt/empty/getOHEF0007M0.do"
+NPS_DETAIL_URL = "https://fund.nps.or.kr/impa/edwmpblnt/getOHEF0010M0.do"
+NPS_REQ_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "X-Requested-With": "XMLHttpRequest",
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+    "Referer": "https://fund.nps.or.kr/impa/edwmpblnt/getOHEF0007M0.do?menuId=MN24000636",
+    "Origin": "https://fund.nps.or.kr",
+}
+
+
+def normalize_corp_name(name):
+    """회사명 정규화: 법인형태 접두·접미 제거 후 공백/특수문자 제거, 소문자화"""
+    s = str(name)
+    s = re.sub(r'주식회사|㈜|\(주\)|\( *주 *\)|co\.,?\s*ltd\.?|inc\.?|corp\.?',
+               '', s, flags=re.IGNORECASE)
+    s = re.sub(r'[\s\u3000\xa0\.\,\-\(\)\[\]]+', '', s)
+    return s.lower()
+
+
+def extract_date_yyyymmdd(date_str):
+    """다양한 날짜 형식 → 'YYYYMMDD' 문자열"""
+    s = re.sub(r'[-/]', '', str(date_str).strip())
+    if re.match(r'^\d{8}$', s):
+        return s
+    m = re.match(r'(\d{4})(\d{1,2})(\d{1,2})', s)
+    if m:
+        return f"{m.group(1)}{int(m.group(2)):02d}{int(m.group(3)):02d}"
+    m = re.search(r'(\d{4})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일', str(date_str))
+    if m:
+        return f"{m.group(1)}{int(m.group(2)):02d}{int(m.group(3)):02d}"
+    return ""
+
+
+def _nps_post(url, payload, retries=4, timeout=30):
+    """JSON body POST → HTML response (text/html 반환)"""
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            resp = requests.post(url, data=json.dumps(payload),
+                                 headers=NPS_REQ_HEADERS, timeout=timeout)
+            resp.raise_for_status()
+            resp.encoding = resp.apparent_encoding or "utf-8"
+            return resp
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                time.sleep(1.5 * attempt)
+    raise last_err
+
+
+def fetch_nps_list_page(page_index, gmos_start_dt, gmos_end_dt):
+    payload = {
+        "pageIndex": page_index,
+        "issueInsNm": "",
+        "gmosStartDt": gmos_start_dt,
+        "gmosEndDt":   gmos_end_dt,
+    }
+    resp = _nps_post(NPS_LIST_URL, payload)
+    return resp.text
+
+
+def parse_nps_last_page(html):
+    """마지막 페이지 번호 추출"""
+    soup = BeautifulSoup(html, 'lxml')
+    nums = []
+    for a in soup.select("a[data-pagenum]"):
+        v = a.get("data-pagenum", "").strip()
+        if v.isdigit():
+            nums.append(int(v))
+    if not nums:
+        for a in soup.select(".pagination a, #paginationInfo a, ul.pager a"):
+            t = re.sub(r'\s+', '', a.get_text())
+            if t.isdigit():
+                nums.append(int(t))
+    return max(nums) if nums else 1
+
+
+def parse_nps_list_rows(html):
+    """목록 HTML에서 정기주총 행만 추출하고 상세 호출 파라미터 반환"""
+    soup = BeautifulSoup(html, 'lxml')
+    rows = []
+    for tr in soup.select("table tbody tr"):
+        tds = tr.find_all("td")
+        if len(tds) < 3:
+            continue
+        row_text = ' '.join(td.get_text(strip=True) for td in tds)
+        if '정기주총' not in row_text:
+            continue
+
+        # fnc_goDetail 파라미터: tr 전체 HTML에서 추출
+        tr_html = str(tr)
+        m = re.search(
+            r"fnc_goDetail\s*\(\s*'([^']*)'\s*,\s*'([^']*)'\s*,\s*'([^']*)'\s*,\s*'([^']*)'\s*,\s*'([^']*)'\s*\)",
+            tr_html
+        )
+        if not m:
+            continue
+
+        a_tag = tr.find("a")
+        company_name = a_tag.get_text(strip=True) if a_tag else tds[1].get_text(strip=True)
+
+        rows.append({
+            "회사명":          company_name,
+            "edwmVtrtUseSn":   m.group(1),
+            "dataPvsnInstCdVl": m.group(2),
+            "pblcnInstCdVl":   m.group(3),
+            "gmosYmd":         m.group(4),
+            "gmosKindCd":      m.group(5),
+        })
+    return rows
+
+
+def fetch_nps_detail_html(item, gmos_start_dt, gmos_end_dt):
+    payload = {
+        "edwmVtrtUseSn":    item["edwmVtrtUseSn"],
+        "dataPvsnInstCdVl": item["dataPvsnInstCdVl"],
+        "pblcnInstCdVl":    item["pblcnInstCdVl"],
+        "gmosYmd":          item["gmosYmd"],
+        "gmosKindCd":       item["gmosKindCd"],
+        "issueInsNm":       "",
+        "gmosStartDt":      gmos_start_dt,
+        "gmosEndDt":        gmos_end_dt,
+    }
+    resp = _nps_post(NPS_DETAIL_URL, payload)
+    return resp.text
+
+
+def parse_nps_detail_votes(detail_html):
+    """
+    상세 HTML → {normalize_num_for_match(의안번호): {의안번호, 의안내용, 행사내용, 반대시 사유, 근거조항}}
+    """
+    soup = BeautifulSoup(detail_html, 'lxml')
+    result = {}
+
+    for table in soup.find_all('table'):
+        table_text_nsp = re.sub(r'\s+', '', table.get_text())
+        if '의안번호' not in table_text_nsp or '행사내용' not in table_text_nsp:
+            continue
+
+        grid = _build_logical_table(table)
+        if not grid or len(grid) < 2:
+            continue
+
+        # 헤더 행 탐지
+        header_rows_idx = []
+        data_start = 0
+        for row_idx, row in enumerate(grid):
+            combined = re.sub(r'\s+', '', ''.join(row))
+            if '의안번호' in combined or '행사내용' in combined:
+                first = re.sub(r'\s+', '', row[0]) if row else ''
+                if not re.match(r'^\d', first):
+                    header_rows_idx.append(row_idx)
+                    data_start = row_idx + 1
+
+        if not header_rows_idx:
+            continue
+
+        # 열별 합성 헤더
+        n_cols = max(len(r) for r in grid)
+        combined_headers = []
+        for col_idx in range(n_cols):
+            parts = []
+            for row_idx in header_rows_idx:
+                if col_idx < len(grid[row_idx]):
+                    t = re.sub(r'[\s\u3000\xa0\(\)①②③④⑤]+', '', grid[row_idx][col_idx])
+                    if t and t not in parts:
+                        parts.append(t)
+            combined_headers.append(''.join(parts))
+
+        def _fcol(keywords, excl=()):
+            for i, h in enumerate(combined_headers):
+                if i in excl:
+                    continue
+                hn = re.sub(r'\s+', '', h)
+                if any(kw in hn for kw in keywords):
+                    return i
+            return -1
+
+        num_col     = _fcol(['의안번호'])
+        content_col = _fcol(['의안내용'], excl=(num_col,))
+        action_col  = _fcol(['행사내용', '행사결과', '찬반'], excl=(num_col, content_col))
+        reason_col  = _fcol(['반대시사유', '반대사유', '반대이유', '사유'],
+                             excl=(num_col, content_col, action_col))
+        basis_col   = _fcol(['근거조항', '근거'],
+                             excl=(num_col, content_col, action_col, reason_col))
+
+        if num_col == -1:
+            continue
+
+        for row in grid[data_start:]:
+            if len(row) <= num_col:
+                continue
+            num_raw = row[num_col].strip()
+            if not num_raw or not re.search(r'\d', num_raw):
+                continue
+
+            def _get_nps(col):
+                return row[col].strip() if 0 <= col < len(row) else ""
+
+            num_key = normalize_num_for_match(num_raw)
+            if num_key:
+                result[num_key] = {
+                    "의안번호":    num_raw,
+                    "의안내용":   _get_nps(content_col),
+                    "행사내용":   _get_nps(action_col),
+                    "반대시 사유": _get_nps(reason_col),
+                    "근거조항":   _get_nps(basis_col),
+                }
+
+    return result
+
+
+def fetch_all_nps_votes(meeting_dates):
+    """
+    meeting_dates: set of "YYYYMMDD" strings
+    반환: {(normalized_corp_name, yyyymmdd): {num_key: vote_data}}
+    """
+    nps_votes = {}
+
+    for yyyymmdd in sorted(meeting_dates):
+        gmos_dt = f"{yyyymmdd[:4]}-{yyyymmdd[4:6]}-{yyyymmdd[6:8]}"
+        print(f"  [NPS] {gmos_dt} 조회 중...")
+
+        try:
+            first_html = fetch_nps_list_page(1, gmos_dt, gmos_dt)
+            last_page = parse_nps_last_page(first_html)
+        except Exception as e:
+            print(f"  [NPS 목록 오류] {gmos_dt}: {e}")
+            continue
+
+        all_items = []
+        for page in range(1, last_page + 1):
+            try:
+                html = first_html if page == 1 else fetch_nps_list_page(page, gmos_dt, gmos_dt)
+                items = parse_nps_list_rows(html)
+                all_items.extend(items)
+                if page > 1:
+                    time.sleep(0.3)
+            except Exception as e:
+                print(f"  [NPS 목록 페이지 오류] {page}: {e}")
+                break
+
+        print(f"  [NPS] {gmos_dt}: 정기주총 {len(all_items)}건")
+
+        for item in all_items:
+            try:
+                detail_html = fetch_nps_detail_html(item, gmos_dt, gmos_dt)
+                votes = parse_nps_detail_votes(detail_html)
+                norm_name = normalize_corp_name(item["회사명"])
+                nps_votes[(norm_name, yyyymmdd)] = votes
+                time.sleep(0.2)
+            except Exception as e:
+                print(f"  [NPS 상세 오류] {item['회사명']}: {e}")
+
+    return nps_votes
+
+
+def _match_nps_vote(nps_votes, corp_name, meeting_date_yyyymmdd, num_key):
+    """
+    회사명+주총일+안건번호로 NPS 데이터 매칭.
+    1) 정확 매칭, 2) 퍼지 회사명 매칭(같은 날짜 한정) 순으로 시도.
+    """
+    norm_name = normalize_corp_name(corp_name)
+    # 1) 정확 매칭
+    exact = nps_votes.get((norm_name, meeting_date_yyyymmdd), {})
+    if num_key in exact:
+        return exact[num_key]
+
+    # 2) 같은 날짜 내에서 퍼지 매칭
+    best_score = 0.0
+    best_votes = {}
+    for (nname, ndate), votes in nps_votes.items():
+        if ndate != meeting_date_yyyymmdd:
+            continue
+        # 포함 관계 또는 앞/뒤 3글자 일치
+        if nname == norm_name:
+            score = 1.0
+        elif nname in norm_name or norm_name in nname:
+            shorter = min(len(nname), len(norm_name))
+            longer  = max(len(nname), len(norm_name))
+            score   = shorter / longer if longer > 0 else 0
+        elif (len(nname) >= 3 and len(norm_name) >= 3 and
+              (nname[:3] == norm_name[:3] or nname[-3:] == norm_name[-3:])):
+            shorter = min(len(nname), len(norm_name))
+            longer  = max(len(nname), len(norm_name))
+            score   = (shorter / longer) * 0.85
+        else:
+            score = 0.0
+
+        if score > best_score:
+            best_score = score
+            best_votes = votes
+
+    if best_score >= 0.6 and num_key in best_votes:
+        return best_votes[num_key]
+
+    return {}
+
+
+# ─────────────────────────────────────────────
+# 8. 메인
 # ─────────────────────────────────────────────
 
 def main():
@@ -2128,7 +2445,10 @@ def main():
         shutil.rmtree(rfolder, ignore_errors=True)
         time.sleep(0.08)
 
-    # [결과] 열 데이터를 각 행에 매핑
+    # [결과] 열 데이터를 각 행에 매핑 (FULL OUTER JOIN)
+    # ─ 소집공고에 있고 결과에도 있으면: 같은 행에 결과 채움
+    # ─ 소집공고에 있고 결과에 없으면: 결과 열 비워둠
+    # ─ 소집공고에 없고 결과에만 있으면: 새 행 추가 (소집공고 열 비움)
     RESULT_COL_NAMES = [
         "[결과] 번호",
         "[결과] 결의구분",
@@ -2139,8 +2459,8 @@ def main():
         "[결과] (1)중 의결권 행사 주식수 기준 반대·기관 등 비율(%)",
         "[결과] 비고",
     ]
-    RESULT_FIELD_MAP = {  # 열 이름 → extract_agm_result_table 반환 키
-        "[결과] 번호":                                    None,  # 안건번호 자체
+    RESULT_FIELD_MAP = {
+        "[결과] 번호":                                    None,   # num_key 자체
         "[결과] 결의구분":                                "결의구분",
         "[결과] 회의목적사항":                            "회의목적사항",
         "[결과] 가결여부":                                "가결여부",
@@ -2150,19 +2470,129 @@ def main():
         "[결과] 비고":                                    "비고",
     }
 
-    for row in all_rows:
-        cc = row.get("_corp_code", "")
-        agenda_num_str = row.get("안건번호", "")
-        num_key = normalize_num_for_match(agenda_num_str)
-        result_data = corp_result_map.get(cc, {}).get(num_key, {})
+    # 알림 컬럼: 한쪽에만 있을 때 표시
+    NOTICE_ONLY_MARK  = ""   # 소집공고에만 있을 때 [결과] 번호 값 (빈 값으로 둠)
+    RESULT_ONLY_NOTICE_COLS = [   # 결과-only 행에서 비울 소집공고 관련 열들
+        "주주제안여부", "주주제안자", "안건분류1", "안건분류2",
+        "[정관] 구분", "[정관] 변경전 내용", "[정관] 변경후 내용", "[정관] 변경의 목적",
+        "[선임] 후보자성명", "[선임] 사외이사 후보자여부",
+        "[선임] 감사위원회 위원인 이사 분리선출 여부", "[선임] 주된직업",
+        "[당기보수] 이사수", "[당기보수] 사외이사수", "[당기보수] 보수총액 또는 최고한도액",
+        "[전기보수] 이사수", "[전기보수] 사외이사수",
+        "[전기보수] 실제 지급된 보수총액", "[전기보수] 최고한도액",
+        "[자사주승인]",
+    ]
 
+    def _fill_result_cols(row, num_key, result_data):
         for col_name in RESULT_COL_NAMES:
             field = RESULT_FIELD_MAP[col_name]
             if field is None:
-                # [결과] 번호: 결과 테이블에서 찾은 번호 그대로 (없으면 빈 값)
                 row[col_name] = num_key if result_data else ""
             else:
                 row[col_name] = result_data.get(field, "")
+
+    # Step 1: 소집공고 행에 결과 매핑 + 매칭된 결과 키 추적
+    used_result_keys = set()  # (corp_code, num_key)
+
+    for row in all_rows:
+        cc = row.get("_corp_code", "")
+        num_key = normalize_num_for_match(row.get("안건번호", ""))
+        result_data = corp_result_map.get(cc, {}).get(num_key, {})
+        _fill_result_cols(row, num_key, result_data)
+        if result_data:
+            used_result_keys.add((cc, num_key))
+
+    # Step 2: 결과보고서에만 있는 항목 → 새 행으로 추가
+    # corp_code별 대표 메타데이터 수집 (회사명, 시장분류, 공고일, 주총일)
+    corp_meta = {}
+    for row in all_rows:
+        cc = row.get("_corp_code", "")
+        if cc and cc not in corp_meta:
+            corp_meta[cc] = {
+                "회사명":   row.get("회사명", ""),
+                "시장분류": row.get("시장분류", ""),
+                "공고일":   row.get("공고일", ""),
+                "주총일":   row.get("주총일", ""),
+                "_corp_code": cc,
+            }
+
+    extra_rows = []
+    for cc, result_table in corp_result_map.items():
+        meta = corp_meta.get(cc)
+        if not meta:
+            continue
+        for num_key, result_data in result_table.items():
+            if (cc, num_key) in used_result_keys:
+                continue
+            # 결과-only 새 행: 소집공고 열은 비우고 결과 열만 채움
+            new_row = {
+                "회사명":   meta["회사명"],
+                "시장분류": meta["시장분류"],
+                "공고일":   meta["공고일"],
+                "주총일":   meta["주총일"],
+                # 소집공고에 없으므로 안건번호/제목은 결과에서 가져옴
+                "안건번호": format_agenda_num(num_key),
+                "안건 제목": result_data.get("회의목적사항", ""),
+                "_corp_code": cc,
+            }
+            for col in RESULT_ONLY_NOTICE_COLS:
+                new_row[col] = ""
+            _fill_result_cols(new_row, num_key, result_data)
+            extra_rows.append(new_row)
+
+    all_rows.extend(extra_rows)
+
+    # Step 3: 회사명 → 공고일 → 안건번호 순 정렬
+    def _row_sort_key(row):
+        corp  = row.get("회사명", "")
+        date  = row.get("공고일", "") or row.get("주총일", "")
+        # 안건번호에서 정렬키 추출 (결과-only 행도 format_agenda_num으로 채웠으므로 동일 함수 사용)
+        num   = normalize_num_for_match(row.get("안건번호", ""))
+        return (corp, date, agenda_sort_key(num))
+
+    all_rows.sort(key=_row_sort_key)
+
+    # ── 국민연금 의결권 행사내역 fetch & 매칭 ──
+    write_progress(progress_file, "running", 97, "국민연금 의결권 행사내역 조회 중...")
+
+    # 고유 주총일(YYYYMMDD) 수집
+    meeting_dates_set = set()
+    for row in all_rows:
+        mt = extract_date_yyyymmdd(row.get("주총일", ""))
+        if mt:
+            meeting_dates_set.add(mt)
+
+    nps_votes = {}
+    if meeting_dates_set:
+        try:
+            nps_votes = fetch_all_nps_votes(meeting_dates_set)
+        except Exception as e:
+            print(f"  [NPS 전체 오류] {e}")
+
+    NPS_COL_NAMES = [
+        "[국민연금] 의안번호",
+        "[국민연금] 의안내용",
+        "[국민연금] 행사내용",
+        "[국민연금] 반대시 사유",
+        "[국민연금] 근거조항",
+    ]
+    NPS_FIELD_MAP = {
+        "[국민연금] 의안번호":   "의안번호",
+        "[국민연금] 의안내용":   "의안내용",
+        "[국민연금] 행사내용":   "행사내용",
+        "[국민연금] 반대시 사유": "반대시 사유",
+        "[국민연금] 근거조항":   "근거조항",
+    }
+
+    for row in all_rows:
+        corp_name_r   = row.get("회사명", "")
+        meeting_date_r = extract_date_yyyymmdd(row.get("주총일", ""))
+        num_key_r      = normalize_num_for_match(row.get("안건번호", ""))
+
+        vote_data = _match_nps_vote(nps_votes, corp_name_r, meeting_date_r, num_key_r)
+
+        for col_name in NPS_COL_NAMES:
+            row[col_name] = vote_data.get(NPS_FIELD_MAP[col_name], "")
 
     # 내부 추적용 _corp_code 열 제거
     for row in all_rows:
